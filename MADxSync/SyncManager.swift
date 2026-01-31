@@ -13,7 +13,7 @@ import Network
 class SyncManager: ObservableObject {
     // MARK: - Published State
     @Published var floConnected = false
-    @Published var floStatus = "Not connected"
+    @Published var floStatus = "Checking..."
     @Published var truckName: String?
     @Published var isSyncing = false
     @Published var hasInternet = false
@@ -34,9 +34,30 @@ class SyncManager: ObservableObject {
     private let monitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "NetworkMonitor")
     
+    // MARK: - FLO Polling Timer
+    private var floPollingTimer: Timer?
+    
     init() {
         loadPendingFromDisk()
         startNetworkMonitor()
+        startFLOPolling()
+    }
+    
+    deinit {
+        floPollingTimer?.invalidate()
+    }
+    
+    // MARK: - FLO Polling (auto-detect connection)
+    private func startFLOPolling() {
+        // Check immediately
+        Task { await checkFLO() }
+        
+        // Then check every 3 seconds
+        floPollingTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.checkFLO()
+            }
+        }
     }
     
     // MARK: - Network Monitoring
@@ -85,7 +106,7 @@ class SyncManager: ObservableObject {
         }
     }
     
-    // MARK: - Check FLO Connection
+    // MARK: - Check FLO Connection (public for manual refresh)
     func checkFLOConnection() {
         Task {
             await checkFLO()
@@ -93,8 +114,6 @@ class SyncManager: ObservableObject {
     }
     
     private func checkFLO() async {
-        log("Checking FLO connection...")
-        
         guard let url = URL(string: "\(floBaseURL)/identity") else {
             floConnected = false
             floStatus = "Invalid URL"
@@ -103,34 +122,47 @@ class SyncManager: ObservableObject {
         
         do {
             let config = URLSessionConfiguration.default
-            config.timeoutIntervalForRequest = 5
+            config.timeoutIntervalForRequest = 2  // Fast timeout for polling
             let session = URLSession(configuration: config)
             
             let (data, response) = try await session.data(from: url)
             
             guard let httpResponse = response as? HTTPURLResponse,
                   httpResponse.statusCode == 200 else {
+                if floConnected {
+                    // Was connected, now lost connection
+                    log("📡 FLO disconnected")
+                }
                 floConnected = false
-                floStatus = "FLO not responding"
+                floStatus = "Not connected"
+                truckName = nil
                 return
             }
             
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let ssid = json["ssid"] as? String {
+                
+                if !floConnected {
+                    // Just connected
+                    log("📡 Connected to FLO: \(ssid)")
+                }
+                
                 floConnected = true
                 truckName = ssid
                 truckSlug = toSlug(ssid)
-                floStatus = "Connected to FLO"
-                log("Connected to: \(ssid)")
+                floStatus = "Connected"
             } else {
                 floConnected = true
-                floStatus = "Connected (unknown truck)"
+                floStatus = "Connected (unknown)"
             }
             
         } catch {
+            if floConnected {
+                log("📡 FLO connection lost")
+            }
             floConnected = false
-            floStatus = "Not connected to FLO"
-            log("FLO connection failed")
+            floStatus = "Not connected"
+            truckName = nil
         }
         
         updateSyncStatus()
@@ -150,7 +182,7 @@ class SyncManager: ObservableObject {
         
         isSyncing = true
         syncComplete = false
-        log("Starting download from FLO...")
+        log("⬇️ Downloading from FLO...")
         
         do {
             // Get file list from FLO
@@ -163,21 +195,20 @@ class SyncManager: ObservableObject {
                 return
             }
 
-            log("Found \(files.count) file(s) to sync")
+            log("Found \(files.count) file(s)")
 
             // Download ALL files - Supabase dedupes via upsert
             for file in files {
-                log("Downloading: \(file.name)")
+                log("  📄 \(file.name)")
                 
                 let csvContent = try await downloadFile(name: file.name)
                 let rows = parseCSV(csvContent)
                 
                 if rows.isEmpty {
-                    log("  (empty file)")
                     continue
                 }
                 
-                log("  Got \(rows.count) rows")
+                log("    └ \(rows.count) rows")
                 
                 // Determine table based on filename
                 let tableName = file.name.contains(".manual") ? "viewer_logs" : "source_logs"
@@ -197,11 +228,9 @@ class SyncManager: ObservableObject {
             savePendingToDisk()
             
             // Clear downloaded files from FLO
-            log("Clearing old files from FLO...")
             try await clearDownloaded()
             
-            log("✅ Downloaded \(files.count) file(s) from FLO")
-            log("📱 Stored locally - waiting for internet")
+            log("✅ Downloaded \(files.count) file(s)")
             
         } catch {
             log("❌ Download failed: \(error.localizedDescription)")
@@ -210,9 +239,9 @@ class SyncManager: ObservableObject {
         isSyncing = false
         updateSyncStatus()
         
-        // Check if we have internet now
+        // Auto-upload if we have internet
         if hasInternet && !pendingData.isEmpty {
-            log("📶 Internet available - uploading now...")
+            log("⬆️ Uploading to cloud...")
             await uploadPendingData()
         }
     }
@@ -220,7 +249,7 @@ class SyncManager: ObservableObject {
     // MARK: - Upload Pending Data (when internet available)
     func uploadPendingData() async {
         guard hasInternet else {
-            log("No internet - will upload later")
+            log("⏳ No internet - will upload later")
             return
         }
         
@@ -229,7 +258,7 @@ class SyncManager: ObservableObject {
         }
         
         isSyncing = true
-        log("Uploading to cloud...")
+        log("⬆️ Uploading \(pendingData.count) file(s)...")
         
         var successCount = 0
         var failedItems: [PendingSync] = []
@@ -238,7 +267,7 @@ class SyncManager: ObservableObject {
             do {
                 // Look up truck ID from Supabase
                 guard let truckId = try await lookupTruckId(slug: pending.truckSlug) else {
-                    log("⚠️ Truck '\(pending.truckSlug)' not in database - skipping")
+                    log("⚠️ Truck '\(pending.truckSlug)' not found")
                     failedItems.append(pending)
                     continue
                 }
@@ -257,11 +286,11 @@ class SyncManager: ObservableObject {
                     truckId: truckId,
                     table: pending.tableName
                 )
-                log("✓ Uploaded \(uploaded) rows to \(pending.tableName)")
+                log("  ✓ \(uploaded) rows → \(pending.tableName)")
                 successCount += 1
                 
             } catch {
-                log("❌ Upload failed: \(error)")
+                log("  ❌ Upload failed")
                 print("Full error: \(error)")
                 failedItems.append(pending)
             }
@@ -275,7 +304,7 @@ class SyncManager: ObservableObject {
             log("✅ All data synced to cloud!")
             syncComplete = true
         } else {
-            log("⚠️ \(failedItems.count) file(s) pending retry")
+            log("⚠️ \(failedItems.count) file(s) failed - will retry")
         }
         
         isSyncing = false

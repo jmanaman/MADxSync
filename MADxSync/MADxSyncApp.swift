@@ -11,7 +11,7 @@ import SwiftUI
 struct MADxSyncApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            MainTabView()
         }
     }
 }

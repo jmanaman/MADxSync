@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		B99DC4B92F2D4BCB001E31E7 /* MapCache in Frameworks */ = {isa = PBXBuildFile; productRef = B99DC4B82F2D4BCB001E31E7 /* MapCache */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		B99DC4A42F2C08D2001E31E7 /* MADxSync.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MADxSync.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -23,6 +27,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B99DC4B92F2D4BCB001E31E7 /* MapCache in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -65,6 +70,7 @@
 			);
 			name = MADxSync;
 			packageProductDependencies = (
+				B99DC4B82F2D4BCB001E31E7 /* MapCache */,
 			);
 			productName = MADxSync;
 			productReference = B99DC4A42F2C08D2001E31E7 /* MADxSync.app */;
@@ -94,6 +100,9 @@
 			);
 			mainGroup = B99DC49B2F2C08D2001E31E7;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				B99DC4B72F2D4BCB001E31E7 /* XCRemoteSwiftPackageReference "MapCache" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = B99DC4A52F2C08D2001E31E7 /* Products */;
 			projectDirPath = "";
@@ -332,6 +341,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		B99DC4B72F2D4BCB001E31E7 /* XCRemoteSwiftPackageReference "MapCache" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/merlos/MapCache.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.10.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		B99DC4B82F2D4BCB001E31E7 /* MapCache */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = B99DC4B72F2D4BCB001E31E7 /* XCRemoteSwiftPackageReference "MapCache" */;
+			productName = MapCache;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = B99DC49C2F2C08D2001E31E7 /* Project object */;
 }

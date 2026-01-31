@@ -1,0 +1,15 @@
+{
+  "originHash" : "47e67204b5b77a0c91737f3a676932d4783799b2fc3c2a05c9d10906ac860e7d",
+  "pins" : [
+    {
+      "identity" : "mapcache",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/merlos/MapCache.git",
+      "state" : {
+        "revision" : "c18c99823de57b6d91c6af248a1e436d380f88cc",
+        "version" : "0.10.0"
+      }
+    }
+  ],
+  "version" : 3
+}
