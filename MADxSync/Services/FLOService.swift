@@ -63,11 +63,11 @@ class FLOService: ObservableObject {
         stopPolling()
         
         // Initial fetch
-        Task { await refreshAll() }
+        Task { await checkConnection() }
         
-        // Poll every 2 seconds
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            Task { await self?.pollLiveData() }
+        // Poll every 5 seconds (not 2) - only poll live data if connected
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { await self?.pollIfConnected() }
         }
     }
     
@@ -76,13 +76,32 @@ class FLOService: ObservableObject {
         pollTimer = nil
     }
     
+    /// Check if FLO is reachable
+    @MainActor
+    private func checkConnection() async {
+        await fetchIdentity()
+    }
+    
+    /// Only poll if we're connected - don't spam when offline
+    @MainActor
+    private func pollIfConnected() async {
+        if isConnected {
+            await pollLiveData()
+        } else {
+            // Just check identity occasionally when disconnected
+            await fetchIdentity()
+        }
+    }
+    
     /// Refresh all data from FLO
     @MainActor
     func refreshAll() async {
         await fetchIdentity()
-        await fetchRelayStatus()
-        await fetchRelayNames()
-        await pollLiveData()
+        if isConnected {
+            await fetchRelayStatus()
+            await fetchRelayNames()
+            await pollLiveData()
+        }
     }
     
     /// Poll frequently changing data (GPS, totals)
