@@ -5,6 +5,7 @@
 //  Main map view with spatial layers and rapid tap-to-drop tools
 //
 //  UPDATED: Uses CompositeFieldOverlay for memory-efficient polygon rendering
+//  UPDATED: NavigationService replaces LocationManager - adds heading arrow + follow mode
 //
 
 import SwiftUI
@@ -22,9 +23,10 @@ enum ActiveTool: Equatable {
 
 /// Main map view with rapid tap-to-drop tools
 struct FieldMapView: View {
-    @StateObject private var locationManager = LocationManager()
+    @StateObject private var navigationService = NavigationService()
     @StateObject private var spatialService = SpatialService.shared
     @StateObject private var layerVisibility = LayerVisibility()
+    @StateObject private var treatmentStatusService = TreatmentStatusService.shared
     @ObservedObject private var floService = FLOService.shared
     @ObservedObject private var markerStore = MarkerStore.shared
     
@@ -54,6 +56,13 @@ struct FieldMapView: View {
     @State private var selectedFeature: SelectedFeature?
     @State private var showFeatureInfo = false
     
+    // Track which features were turned green by treatment drops (for undo)
+    @State private var treatedFeatureStack: [String] = []
+    
+    // Larvae picker state
+    @State private var selectedLarvaeLevel: LarvaeLevel = .few
+    @State private var pupaeSelected: Bool = false
+    
     var body: some View {
         ZStack {
             // Map with spatial layers
@@ -62,11 +71,13 @@ struct FieldMapView: View {
                 markers: markerStore.markers,
                 spatialService: spatialService,
                 layerVisibility: layerVisibility,
+                treatmentStatusService: treatmentStatusService,
+                navigationService: navigationService,
+                activeTool: activeTool,
                 onTap: handleMapTap,
                 onFeatureSelected: { feature in
                     selectedFeature = feature
                     showFeatureInfo = true
-                    // Haptic feedback on feature tap
                     let impact = UIImpactFeedbackGenerator(style: .rigid)
                     impact.impactOccurred()
                 }
@@ -78,10 +89,7 @@ struct FieldMapView: View {
                 // Top bar: FLO Control + Layer button
                 HStack(alignment: .top) {
                     FLOControlView()
-                    
                     Spacer()
-                    
-                    // Layer toggle button
                     LayerButton(
                         showLayerSheet: $showLayerSheet,
                         featureCount: spatialService.totalFeatures
@@ -90,7 +98,7 @@ struct FieldMapView: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
                 
-                // Context strip RIGHT UNDER FLO (when treatment tool active)
+                // Context strip (when treatment tool active)
                 if activeTool == .treatment {
                     treatmentContextStrip
                         .padding(.horizontal, 12)
@@ -100,11 +108,11 @@ struct FieldMapView: View {
                 
                 Spacer()
                 
-                // Bottom bar with GPS + active tool indicator
+                // Bottom bar with GPS + nav + active tool indicator
                 bottomBar
             }
             
-            // Tool FABs (right side) - positioned independently
+            // Tool FABs (right side)
             VStack {
                 Spacer()
                 HStack {
@@ -112,7 +120,7 @@ struct FieldMapView: View {
                     toolFABColumn
                 }
             }
-            .padding(.bottom, 60)  // Above bottom bar
+            .padding(.bottom, 60)
             .padding(.trailing, 16)
             
             // Larvae quick picker modal
@@ -122,13 +130,16 @@ struct FieldMapView: View {
             }
         }
         .onAppear {
-            locationManager.requestPermission()
+            navigationService.requestPermission()
             
-            // Load spatial data if not already loaded
             if !spatialService.hasData {
                 Task {
                     await spatialService.loadAllLayers()
                 }
+            }
+            
+            Task {
+                await treatmentStatusService.syncFromHub()
             }
         }
         .sheet(isPresented: $showLayerSheet) {
@@ -150,15 +161,10 @@ struct FieldMapView: View {
     private func handleMapTap(_ coordinate: CLLocationCoordinate2D) {
         switch activeTool {
         case .none:
-            // No tool active - do nothing (or could show info)
             break
-            
         case .treatment:
-            // Instant drop treatment marker
             dropTreatmentMarker(at: coordinate)
-            
         case .larvae:
-            // Show quick picker for larvae level
             pendingLarvaeCoordinate = coordinate
             showLarvaePicker = true
         }
@@ -178,11 +184,51 @@ struct FieldMapView: View {
         
         markerStore.addMarker(marker)
         
-        // Haptic feedback
+        // Both TREATED and OBSERVED reset the treatment clock (turn green)
+        if treatmentStatus == .treated || treatmentStatus == .observed {
+            let hitFeature = SpatialHitTester.hitTest(
+                coordinate: coordinate,
+                fields: spatialService.fields,
+                polylines: spatialService.polylines,
+                pointSites: spatialService.pointSites,
+                stormDrains: spatialService.stormDrains,
+                mapView: nil
+            )
+            
+            if let feature = hitFeature {
+                let featureId: String
+                let featureType: String
+                switch feature {
+                case .field(let f):
+                    featureId = f.id
+                    featureType = "field"
+                case .polyline(let p):
+                    featureId = p.id
+                    featureType = "polyline"
+                case .pointSite(let s):
+                    featureId = s.id
+                    featureType = "pointsite"
+                case .stormDrain(let d):
+                    featureId = d.id
+                    featureType = "stormdrain"
+                }
+                
+                treatmentStatusService.markTreatedLocally(
+                    featureId: featureId,
+                    featureType: featureType,
+                    chemical: selectedChemical
+                )
+                treatedFeatureStack.append(featureId)
+            } else {
+                treatedFeatureStack.append("")
+            }
+        } else {
+            treatedFeatureStack.append("")
+        }
+        
         let impact = UIImpactFeedbackGenerator(style: .medium)
         impact.impactOccurred()
         
-        // Sync to FLO if connected
         if floService.isConnected {
             Task {
                 let payload = marker.toFLOPayload()
@@ -207,11 +253,9 @@ struct FieldMapView: View {
         
         markerStore.addMarker(marker)
         
-        // Haptic feedback
         let impact = UIImpactFeedbackGenerator(style: .light)
         impact.impactOccurred()
         
-        // Sync to FLO if connected
         if floService.isConnected {
             Task {
                 let payload = marker.toFLOPayload()
@@ -219,43 +263,30 @@ struct FieldMapView: View {
             }
         }
         
-        // Reset
         showLarvaePicker = false
         pendingLarvaeCoordinate = nil
     }
     
-    // MARK: - Dose Presets by Unit (matches FLO viewer.tool.js)
+    // MARK: - Dose Presets by Unit
     private var dosePresetsForUnit: [Double] {
         switch doseUnit {
-        case .oz, .flOz:
-            return [0.5, 1, 2, 4, 8]
-        case .gal:
-            return [0.25, 0.5, 1, 2]
-        case .briq:
-            return [1, 2, 4]
-        case .grams:
-            return [10, 25, 50, 100]
-        case .ml:
-            return [10, 25, 50, 100]
-        case .L:
-            return [1, 5, 10]
-        case .lb:
-            return [0.5, 1, 2, 5]
-        case .pouch, .packet:
-            return [1, 2, 3, 4]
-        case .tablet:
-            return [1, 2, 4, 8]
-        case .each:
-            return [10, 25, 50, 100]
+        case .oz, .flOz: return [0.5, 1, 2, 4, 8]
+        case .gal: return [0.25, 0.5, 1, 2]
+        case .briq: return [1, 2, 4]
+        case .grams: return [10, 25, 50, 100]
+        case .ml: return [10, 25, 50, 100]
+        case .L: return [1, 5, 10]
+        case .lb: return [0.5, 1, 2, 5]
+        case .pouch, .packet: return [1, 2, 3, 4]
+        case .tablet: return [1, 2, 4, 8]
+        case .each: return [10, 25, 50, 100]
         }
     }
     
     // MARK: - Treatment Context Strip
     private var treatmentContextStrip: some View {
         VStack(spacing: 10) {
-            // Row 1: Family picker (segmented) + Status toggle
             HStack {
-                // Family picker
                 Picker("", selection: $treatmentFamily) {
                     ForEach(TreatmentFamily.allCases) { f in
                         Text(f.displayName).tag(f)
@@ -266,7 +297,6 @@ struct FieldMapView: View {
                 
                 Spacer()
                 
-                // Status toggle (TREATED / OBSERVED)
                 Button(action: {
                     treatmentStatus = treatmentStatus == .treated ? .observed : .treated
                 }) {
@@ -280,16 +310,13 @@ struct FieldMapView: View {
                 }
             }
             
-            // Row 2: Chemical + Dose + Unit
             HStack(spacing: 10) {
-                // Chemical picker
                 Menu {
                     ForEach(ChemicalData.byCategory, id: \.category) { group in
                         Section(group.category.rawValue) {
                             ForEach(group.chemicals) { chem in
                                 Button(chem.name) {
                                     selectedChemical = chem.name
-                                    // Auto-select sensible unit for chemical
                                     updateUnitForChemical(chem.name)
                                 }
                             }
@@ -312,7 +339,6 @@ struct FieldMapView: View {
                 
                 Spacer()
                 
-                // Dose input
                 TextField("0", value: $doseValue, format: .number)
                     .keyboardType(.decimalPad)
                     .font(.system(.body, design: .monospaced))
@@ -322,12 +348,9 @@ struct FieldMapView: View {
                     .background(Color(.secondarySystemBackground))
                     .cornerRadius(6)
                 
-                // Unit picker
                 Menu {
                     ForEach(DoseUnit.allCases) { unit in
-                        Button(unit.rawValue) {
-                            doseUnit = unit
-                        }
+                        Button(unit.rawValue) { doseUnit = unit }
                     }
                 } label: {
                     Text(doseUnit.rawValue)
@@ -339,12 +362,9 @@ struct FieldMapView: View {
                 }
             }
             
-            // Row 3: Dose presets (changes based on unit)
             HStack(spacing: 6) {
                 ForEach(dosePresetsForUnit, id: \.self) { preset in
-                    Button(action: {
-                        doseValue = preset
-                    }) {
+                    Button(action: { doseValue = preset }) {
                         Text(formatPreset(preset))
                             .font(.caption.monospacedDigit())
                             .padding(.horizontal, 12)
@@ -362,7 +382,6 @@ struct FieldMapView: View {
         .background(.ultraThinMaterial)
     }
     
-    // Format preset display (remove trailing zeros)
     private func formatPreset(_ value: Double) -> String {
         if value == floor(value) {
             return String(format: "%.0f", value)
@@ -371,42 +390,21 @@ struct FieldMapView: View {
         }
     }
     
-    // Auto-select unit based on chemical type
     private func updateUnitForChemical(_ chemName: String) {
         let name = chemName.lowercased()
-        
-        if name.contains("fish") {
-            doseUnit = .each
-            doseValue = 25
-        } else if name.contains("briq") || name.contains("altosid sr") {
-            doseUnit = .briq
-            doseValue = 1
-        } else if name.contains("pouch") || name.contains("natular") {
-            doseUnit = .pouch
-            doseValue = 1
-        } else if name.contains("wsp") || name.contains("packet") {
-            doseUnit = .packet
-            doseValue = 1
-        } else if name.contains("tablet") || name.contains("dt") {
-            doseUnit = .tablet
-            doseValue = 1
-        } else if name.contains("oil") || name.contains("agnique") || name.contains("mmf") {
-            doseUnit = .gal
-            doseValue = 0.5
-        } else if name.contains("sand") || name.contains("gs") || name.contains("fg") || name.contains("g30") {
-            doseUnit = .lb
-            doseValue = 1
-        } else {
-            // Default for liquids
-            doseUnit = .oz
-            doseValue = 4
-        }
+        if name.contains("fish") { doseUnit = .each; doseValue = 25 }
+        else if name.contains("briq") || name.contains("altosid sr") { doseUnit = .briq; doseValue = 1 }
+        else if name.contains("pouch") || name.contains("natular") { doseUnit = .pouch; doseValue = 1 }
+        else if name.contains("wsp") || name.contains("packet") { doseUnit = .packet; doseValue = 1 }
+        else if name.contains("tablet") || name.contains("dt") { doseUnit = .tablet; doseValue = 1 }
+        else if name.contains("oil") || name.contains("agnique") || name.contains("mmf") { doseUnit = .gal; doseValue = 0.5 }
+        else if name.contains("sand") || name.contains("gs") || name.contains("fg") || name.contains("g30") { doseUnit = .lb; doseValue = 1 }
+        else { doseUnit = .oz; doseValue = 4 }
     }
     
-    // MARK: - Tool FAB Column (right side)
+    // MARK: - Tool FAB Column
     private var toolFABColumn: some View {
         VStack(spacing: 12) {
-            // Treatment Tool
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.15)) {
                     activeTool = activeTool == .treatment ? .none : .treatment
@@ -421,7 +419,6 @@ struct FieldMapView: View {
                     .shadow(radius: 4)
             }
             
-            // Larvae Tool
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.15)) {
                     activeTool = activeTool == .larvae ? .none : .larvae
@@ -435,7 +432,6 @@ struct FieldMapView: View {
                     .shadow(radius: 4)
             }
             
-            // Undo button (only if markers exist)
             if !markerStore.markers.isEmpty {
                 Button(action: undoLastMarker) {
                     Image(systemName: "arrow.uturn.backward")
@@ -451,12 +447,8 @@ struct FieldMapView: View {
     }
     
     // MARK: - Larvae Quick Picker
-    @State private var selectedLarvaeLevel: LarvaeLevel = .few
-    @State private var pupaeSelected: Bool = false
-    
     private var larvaeQuickPicker: some View {
         ZStack {
-            // Dimmed background
             Color.black.opacity(0.4)
                 .edgesIgnoringSafeArea(.all)
                 .onTapGesture {
@@ -464,31 +456,24 @@ struct FieldMapView: View {
                     pendingLarvaeCoordinate = nil
                 }
             
-            // Picker card
             VStack(spacing: 16) {
                 Text("Larvae Level")
                     .font(.headline)
                 
-                // Level buttons - tap to select, tap again to confirm
                 HStack(spacing: 12) {
                     ForEach(LarvaeLevel.allCases) { level in
-                        Button(action: {
-                            selectedLarvaeLevel = level
-                        }) {
+                        Button(action: { selectedLarvaeLevel = level }) {
                             VStack(spacing: 4) {
                                 ZStack {
                                     Circle()
                                         .fill(Color(hex: level.color))
                                         .frame(width: 44, height: 44)
-                                    
-                                    // Selection ring
                                     if selectedLarvaeLevel == level {
                                         Circle()
                                             .stroke(Color.primary, lineWidth: 3)
                                             .frame(width: 52, height: 52)
                                     }
                                 }
-                                
                                 Text(level.displayName)
                                     .font(.caption)
                                     .foregroundColor(selectedLarvaeLevel == level ? .primary : .secondary)
@@ -498,21 +483,14 @@ struct FieldMapView: View {
                     }
                 }
                 
-                // Pupae toggle - big and obvious
-                Button(action: {
-                    pupaeSelected.toggle()
-                }) {
+                Button(action: { pupaeSelected.toggle() }) {
                     HStack {
                         Image(systemName: pupaeSelected ? "checkmark.circle.fill" : "circle")
                             .font(.title2)
                             .foregroundColor(pupaeSelected ? .pink : .gray)
-                        
                         Text("Pupae Present")
                             .font(.headline)
-                        
-                        if pupaeSelected {
-                            Text("🔴")
-                        }
+                        if pupaeSelected { Text("🔴") }
                     }
                     .padding(.horizontal, 20)
                     .padding(.vertical, 12)
@@ -521,7 +499,6 @@ struct FieldMapView: View {
                 }
                 .buttonStyle(.plain)
                 
-                // Action buttons
                 HStack(spacing: 16) {
                     Button("Cancel") {
                         showLarvaePicker = false
@@ -533,7 +510,6 @@ struct FieldMapView: View {
                     
                     Button(action: {
                         dropLarvaeMarker(level: selectedLarvaeLevel, pupae: pupaeSelected)
-                        // Reset pupae for next marker (level persists)
                         pupaeSelected = false
                     }) {
                         HStack {
@@ -559,17 +535,40 @@ struct FieldMapView: View {
     
     // MARK: - Bottom Bar
     private var bottomBar: some View {
-        HStack(spacing: 16) {
-            // GPS status
+        HStack(spacing: 12) {
+            // Follow button
+            Button(action: { navigationService.toggleFollow() }) {
+                Image(systemName: navigationService.isFollowing ? "location.fill" : "location")
+                    .font(.body)
+                    .foregroundColor(navigationService.isFollowing ? .white : .blue)
+                    .frame(width: 36, height: 36)
+                    .background(navigationService.isFollowing ? Color.blue : Color(.secondarySystemBackground))
+                    .clipShape(Circle())
+            }
+            
+            // GPS status + coordinates
             HStack(spacing: 6) {
                 Circle()
-                    .fill(locationManager.hasLocation ? Color.green : Color.red)
+                    .fill(navigationService.hasLocation ? Color.green : Color.red)
                     .frame(width: 8, height: 8)
-                
-                if let location = locationManager.location {
+                if let location = navigationService.location {
                     Text(String(format: "%.4f, %.4f", location.coordinate.latitude, location.coordinate.longitude))
                         .font(.caption.monospacedDigit())
                 }
+            }
+            
+            // Speed
+            if let speed = navigationService.speedMPH, speed >= 1 {
+                Text(String(format: "%.0f mph", speed))
+                    .font(.caption.bold().monospacedDigit())
+                    .foregroundColor(.secondary)
+            }
+            
+            // Heading cardinal
+            if navigationService.hasHeading {
+                Text(headingCardinal(navigationService.heading))
+                    .font(.caption.bold())
+                    .foregroundColor(.secondary)
             }
             
             Spacer()
@@ -601,37 +600,47 @@ struct FieldMapView: View {
         .background(.ultraThinMaterial)
     }
     
+    private func headingCardinal(_ degrees: CLLocationDirection) -> String {
+        let directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+        let index = Int(((degrees + 22.5).truncatingRemainder(dividingBy: 360)) / 45)
+        return directions[index]
+    }
+    
     // MARK: - Undo
     private func undoLastMarker() {
         guard !markerStore.markers.isEmpty else { return }
         markerStore.markers.removeLast()
-        
+        if let featureId = treatedFeatureStack.popLast(), !featureId.isEmpty {
+            treatmentStatusService.revertLocalTreatment(featureId: featureId)
+        }
         let impact = UIImpactFeedbackGenerator(style: .light)
         impact.impactOccurred()
     }
 }
 
-// MARK: - Spatial Map View (with layer rendering)
+// MARK: - Spatial Map View (with layer rendering + navigation)
 
 struct SpatialMapView: UIViewRepresentable {
     @Binding var region: MKCoordinateRegion
     let markers: [FieldMarker]
     @ObservedObject var spatialService: SpatialService
     @ObservedObject var layerVisibility: LayerVisibility
+    @ObservedObject var treatmentStatusService: TreatmentStatusService
+    @ObservedObject var navigationService: NavigationService
+    let activeTool: ActiveTool
     let onTap: (CLLocationCoordinate2D) -> Void
     let onFeatureSelected: (SelectedFeature) -> Void
     
     func makeUIView(context: Context) -> MKMapView {
         let mapView = MKMapView()
         mapView.delegate = context.coordinator
-        mapView.showsUserLocation = true
+        // We draw our own heading arrow — don't use MapKit's blue dot
+        mapView.showsUserLocation = false
         mapView.setRegion(region, animated: false)
         
-        // Tap gesture
         let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
         mapView.addGestureRecognizer(tapGesture)
         
-        // MapCache for offline tiles
         let config = MapCacheConfig(withUrlTemplate: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png")
         let mapCache = MapCache(withConfig: config)
         mapView.useCache(mapCache)
@@ -640,14 +649,17 @@ struct SpatialMapView: UIViewRepresentable {
     }
     
     func updateUIView(_ mapView: MKMapView, context: Context) {
+        context.coordinator.parent = self
         context.coordinator.updateCount += 1
-        print("[Map] updateUIView called - count: \(context.coordinator.updateCount)")
         
-        // Update spatial overlays
+        // Force SwiftUI to track nav changes for re-render
+        let _ = navigationService.location
+        let _ = navigationService.heading
+        let _ = navigationService.isFollowing
+        
         context.coordinator.updateSpatialLayers(mapView: mapView)
-        
-        // Update marker annotations (smart diff)
         context.coordinator.updateMarkers(mapView: mapView, markers: markers)
+        context.coordinator.updateNavigation(mapView: mapView)
     }
     
     func makeCoordinator() -> Coordinator {
@@ -658,16 +670,15 @@ struct SpatialMapView: UIViewRepresentable {
         var parent: SpatialMapView
         var updateCount = 0
         
-        // Track what we've added to avoid duplicates
         private var currentBoundaryIds: Set<String> = []
         private var hasFieldOverlay = false
         private var hasPolylineOverlay = false
         private var currentPointSiteIds: Set<String> = []
         private var currentStormDrainIds: Set<String> = []
-        
-        // Track data versions to detect changes
         private var lastFieldCount = 0
         private var lastPolylineCount = 0
+        private var lastStatusVersion = 0
+        private var hasHeadingOverlay = false
         
         init(_ parent: SpatialMapView) {
             self.parent = parent
@@ -678,12 +689,10 @@ struct SpatialMapView: UIViewRepresentable {
             let point = gesture.location(in: mapView)
             let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
             
-            // When no tool is active, try to identify tapped feature
-            // When a tool IS active, pass through to tool handler (drop marker)
             let service = parent.spatialService
             let visibility = parent.layerVisibility
+            let toolActive = parent.activeTool != .none
             
-            // Hit test against visible layers (only when no tool active for feature ID)
             let feature = SpatialHitTester.hitTest(
                 coordinate: coordinate,
                 fields: visibility.showFields ? service.fields : [],
@@ -693,26 +702,24 @@ struct SpatialMapView: UIViewRepresentable {
                 mapView: mapView
             )
             
-            if let feature = feature {
-                // Found a feature - show info (works regardless of tool state)
-                parent.onFeatureSelected(feature)
-                
-                // Add highlight overlay for selected feature
-                addSelectionHighlight(feature: feature, mapView: mapView)
-            } else {
-                // No feature found - pass to tool handler
+            if toolActive {
                 removeSelectionHighlight(mapView: mapView)
                 parent.onTap(coordinate)
+            } else {
+                if let feature = feature {
+                    parent.onFeatureSelected(feature)
+                    addSelectionHighlight(feature: feature, mapView: mapView)
+                } else {
+                    removeSelectionHighlight(mapView: mapView)
+                    parent.onTap(coordinate)
+                }
             }
         }
         
         // MARK: - Selection Highlight
         
-        /// Adds a single bright overlay for the selected feature
         private func addSelectionHighlight(feature: SelectedFeature, mapView: MKMapView) {
-            // Remove previous highlight
             removeSelectionHighlight(mapView: mapView)
-            
             switch feature {
             case .field(let field):
                 if let polygon = field.mkPolygon {
@@ -725,23 +732,80 @@ struct SpatialMapView: UIViewRepresentable {
                     mapView.addOverlay(titled, level: .aboveLabels)
                 }
             default:
-                break  // Points are annotations, they highlight via callout
+                break
             }
         }
         
-        /// Removes highlight overlay
         private func removeSelectionHighlight(mapView: MKMapView) {
             let toRemove = mapView.overlays.filter { overlay in
-                if let polygon = overlay as? MKPolygon, polygon.title == "SELECTED_FIELD" {
-                    return true
-                }
-                if let titled = overlay as? TitledOverlay, titled.identifier == "SELECTED_POLYLINE" {
-                    return true
-                }
+                if let polygon = overlay as? MKPolygon, polygon.title == "SELECTED_FIELD" { return true }
+                if let titled = overlay as? TitledOverlay, titled.identifier == "SELECTED_POLYLINE" { return true }
                 return false
             }
-            if !toRemove.isEmpty {
-                mapView.removeOverlays(toRemove)
+            if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
+        }
+        
+        // MARK: - Navigation Update
+        
+        func updateNavigation(mapView: MKMapView) {
+            let nav = parent.navigationService
+            
+            guard nav.hasLocation, let location = nav.location else {
+                if hasHeadingOverlay { removeHeadingOverlay(mapView: mapView) }
+                return
+            }
+            
+            // Update heading arrow
+            updateHeadingOverlay(
+                mapView: mapView,
+                coordinate: location.coordinate,
+                heading: nav.heading,
+                accuracy: location.horizontalAccuracy
+            )
+            
+            // Follow mode: keep user centered
+            if nav.isFollowing {
+                let currentCenter = mapView.centerCoordinate
+                let distance = location.distance(from: CLLocation(latitude: currentCenter.latitude, longitude: currentCenter.longitude))
+                
+                // Only pan if moved >5m (avoids jitter)
+                if distance > 5 {
+                    let followRegion = MKCoordinateRegion(
+                        center: location.coordinate,
+                        span: MKCoordinateSpan(latitudeDelta: nav.followZoomSpan, longitudeDelta: nav.followZoomSpan)
+                    )
+                    mapView.setRegion(followRegion, animated: true)
+                }
+            }
+        }
+        
+        private func updateHeadingOverlay(mapView: MKMapView, coordinate: CLLocationCoordinate2D, heading: CLLocationDirection, accuracy: CLLocationAccuracy) {
+            removeHeadingOverlay(mapView: mapView)
+            let arrow = HeadingArrowOverlay(coordinate: coordinate, heading: heading, accuracy: accuracy)
+            mapView.addOverlay(arrow, level: .aboveLabels)
+            hasHeadingOverlay = true
+        }
+        
+        private func removeHeadingOverlay(mapView: MKMapView) {
+            let toRemove = mapView.overlays.filter { $0 is HeadingArrowOverlay }
+            if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
+            hasHeadingOverlay = false
+        }
+        
+        // MARK: - Detect User Pan (disable follow)
+        
+        func mapView(_ mapView: MKMapView, regionWillChangeAnimated animated: Bool) {
+            // If user is dragging/pinching the map, disable follow mode
+            if let view = mapView.subviews.first,
+               let recognizers = view.gestureRecognizers {
+                for recognizer in recognizers {
+                    if recognizer.state == .began || recognizer.state == .ended {
+                        if parent.navigationService.isFollowing {
+                            parent.navigationService.isFollowing = false
+                        }
+                        break
+                    }
+                }
             }
         }
         
@@ -751,27 +815,17 @@ struct SpatialMapView: UIViewRepresentable {
             let service = parent.spatialService
             let visibility = parent.layerVisibility
             
-            // Boundaries (still use individual overlays - only 4 of them)
             updateBoundaries(mapView: mapView, show: visibility.showBoundaries, data: service.boundaries)
-            
-            // Fields - NOW USES COMPOSITE OVERLAY
             updateFieldsComposite(mapView: mapView, show: visibility.showFields, data: service.fields)
-            
-            // Polylines - NOW USES COMPOSITE OVERLAY
             updatePolylinesComposite(mapView: mapView, show: visibility.showPolylines, data: service.polylines)
-            
-            // Point Sites (annotations - unchanged)
             updatePointSites(mapView: mapView, show: visibility.showPointSites, data: service.pointSites)
-            
-            // Storm Drains (annotations - unchanged)
             updateStormDrains(mapView: mapView, show: visibility.showStormDrains, data: service.stormDrains)
+            lastStatusVersion = parent.treatmentStatusService.statusVersion
         }
         
         private func updateBoundaries(mapView: MKMapView, show: Bool, data: [DistrictBoundary]) {
             let newIds = show ? Set(data.map { $0.id }) : []
-            
             if newIds != currentBoundaryIds {
-                // Remove old
                 let toRemove = mapView.overlays.filter { overlay in
                     if let titled = overlay as? TitledOverlay, titled.layerType == .boundary {
                         return !newIds.contains(titled.identifier)
@@ -779,8 +833,6 @@ struct SpatialMapView: UIViewRepresentable {
                     return false
                 }
                 mapView.removeOverlays(toRemove)
-                
-                // Add new
                 if show {
                     for boundary in data {
                         for overlay in boundary.mkOverlays {
@@ -789,145 +841,102 @@ struct SpatialMapView: UIViewRepresentable {
                         }
                     }
                 }
-                
                 currentBoundaryIds = newIds
             }
         }
         
-        // MARK: - COMPOSITE FIELD OVERLAY (replaces individual polygons)
-        
         private func updateFieldsComposite(mapView: MKMapView, show: Bool, data: [FieldPolygon]) {
             let dataChanged = data.count != lastFieldCount
             let visibilityChanged = show != hasFieldOverlay
+            let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
+            guard dataChanged || visibilityChanged || statusChanged else { return }
             
-            guard dataChanged || visibilityChanged else { return }
-            
-            // Remove existing composite overlay
             let toRemove = mapView.overlays.filter { $0 is CompositeFieldOverlay }
-            if !toRemove.isEmpty {
-                mapView.removeOverlays(toRemove)
-                print("[Map] Removed \(toRemove.count) composite field overlay(s)")
-            }
-            
-            // Add new composite if visible and has data
+            if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
             if show && !data.isEmpty {
-                let composite = CompositeFieldOverlay(fields: data)
+                let statusService = parent.treatmentStatusService
+                let composite = CompositeFieldOverlay(fields: data) { featureId in
+                    statusService.colorForFeature(featureId)
+                }
                 mapView.addOverlay(composite, level: .aboveLabels)
-                print("[Map] Added CompositeFieldOverlay with \(composite.polygons.count) polygons")
             }
-            
             hasFieldOverlay = show && !data.isEmpty
             lastFieldCount = data.count
         }
         
-        // MARK: - COMPOSITE POLYLINE OVERLAY (replaces individual polylines)
-        
         private func updatePolylinesComposite(mapView: MKMapView, show: Bool, data: [SpatialPolyline]) {
             let dataChanged = data.count != lastPolylineCount
             let visibilityChanged = show != hasPolylineOverlay
+            let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
+            guard dataChanged || visibilityChanged || statusChanged else { return }
             
-            guard dataChanged || visibilityChanged else { return }
-            
-            // Remove existing composite overlay
             let toRemove = mapView.overlays.filter { $0 is CompositePolylineOverlay }
-            if !toRemove.isEmpty {
-                mapView.removeOverlays(toRemove)
-                print("[Map] Removed \(toRemove.count) composite polyline overlay(s)")
-            }
-            
-            // Add new composite if visible and has data
+            if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
             if show && !data.isEmpty {
-                let composite = CompositePolylineOverlay(polylines: data)
+                let statusService = parent.treatmentStatusService
+                let composite = CompositePolylineOverlay(polylines: data) { featureId in
+                    statusService.colorForFeature(featureId)
+                }
                 mapView.addOverlay(composite, level: .aboveLabels)
-                print("[Map] Added CompositePolylineOverlay with \(composite.polylines.count) polylines")
             }
-            
             hasPolylineOverlay = show && !data.isEmpty
             lastPolylineCount = data.count
         }
         
         private func updatePointSites(mapView: MKMapView, show: Bool, data: [PointSite]) {
             let newIds = show ? Set(data.map { $0.id }) : []
-            
-            if newIds != currentPointSiteIds {
-                // Remove old annotations
-                let toRemove = mapView.annotations.filter { annotation in
-                    if let spatial = annotation as? SpatialAnnotation, spatial.layerType == .pointSite {
-                        return !newIds.contains(spatial.identifier)
-                    }
-                    return false
-                }
+            let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
+            if newIds != currentPointSiteIds || statusChanged {
+                let toRemove = mapView.annotations.filter { ($0 as? SpatialAnnotation)?.layerType == .pointSite }
                 mapView.removeAnnotations(toRemove)
-                
                 if show {
+                    let statusService = parent.treatmentStatusService
                     for site in data {
                         if let coord = site.coordinate {
-                            let annotation = SpatialAnnotation(
-                                coordinate: coord,
-                                type: .pointSite,
-                                id: site.id,
-                                title: site.displayName,
-                                color: site.markerColor
-                            )
+                            let color = statusService.colorForFeature(site.id)
+                            let annotation = SpatialAnnotation(coordinate: coord, type: .pointSite, id: site.id, title: site.displayName, color: color)
                             mapView.addAnnotation(annotation)
                         }
                     }
                 }
-                
                 currentPointSiteIds = newIds
             }
         }
         
         private func updateStormDrains(mapView: MKMapView, show: Bool, data: [StormDrain]) {
             let newIds = show ? Set(data.map { $0.id }) : []
-            
-            if newIds != currentStormDrainIds {
-                let toRemove = mapView.annotations.filter { annotation in
-                    if let spatial = annotation as? SpatialAnnotation, spatial.layerType == .stormDrain {
-                        return !newIds.contains(spatial.identifier)
-                    }
-                    return false
-                }
+            let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
+            if newIds != currentStormDrainIds || statusChanged {
+                let toRemove = mapView.annotations.filter { ($0 as? SpatialAnnotation)?.layerType == .stormDrain }
                 mapView.removeAnnotations(toRemove)
-                
                 if show {
+                    let statusService = parent.treatmentStatusService
                     for drain in data {
                         if let coord = drain.coordinate {
-                            let annotation = SpatialAnnotation(
-                                coordinate: coord,
-                                type: .stormDrain,
-                                id: drain.id,
-                                title: drain.name,
-                                color: drain.markerColor
-                            )
+                            let color = statusService.colorForFeature(drain.id)
+                            let annotation = SpatialAnnotation(coordinate: coord, type: .stormDrain, id: drain.id, title: drain.name, color: color)
                             mapView.addAnnotation(annotation)
                         }
                     }
                 }
-                
                 currentStormDrainIds = newIds
             }
         }
         
-        // MARK: - Update Markers (existing logic)
+        // MARK: - Update Markers
         
         func updateMarkers(mapView: MKMapView, markers: [FieldMarker]) {
             let existingAnnotations = mapView.annotations.compactMap { $0 as? MarkerAnnotation }
             let existingIds = Set(existingAnnotations.map { $0.marker.id })
             let newIds = Set(markers.map { $0.id })
             
-            // Remove annotations that no longer exist
             let toRemove = existingAnnotations.filter { !newIds.contains($0.marker.id) }
-            if !toRemove.isEmpty {
-                mapView.removeAnnotations(toRemove)
-            }
+            if !toRemove.isEmpty { mapView.removeAnnotations(toRemove) }
             
-            // Add annotations that are new
             let idsToAdd = newIds.subtracting(existingIds)
             let toAdd = markers.filter { idsToAdd.contains($0.id) }
             for marker in toAdd {
-                let annotation = MarkerAnnotation(marker: marker)
-                mapView.addAnnotation(annotation)
+                mapView.addAnnotation(MarkerAnnotation(marker: marker))
             }
         }
         
@@ -936,35 +945,27 @@ struct SpatialMapView: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if annotation is MKUserLocation { return nil }
             
-            // Spatial annotations (point sites, storm drains)
             if let spatial = annotation as? SpatialAnnotation {
                 let identifier = "SpatialAnnotation"
                 var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier)
-                
                 if view == nil {
                     view = MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
                     view?.canShowCallout = true
                 }
-                
                 view?.annotation = annotation
                 view?.image = spatial.markerImage
-                
                 return view
             }
             
-            // Field markers (treatment/larvae)
             if let markerAnnotation = annotation as? MarkerAnnotation {
                 let identifier = "FieldMarker"
                 var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier)
-                
                 if view == nil {
                     view = MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
                     view?.canShowCallout = false
                 }
-                
                 view?.annotation = annotation
                 view?.image = markerAnnotation.markerImage
-                
                 return view
             }
             
@@ -972,7 +973,12 @@ struct SpatialMapView: UIViewRepresentable {
         }
         
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
-            // SELECTED FIELD HIGHLIGHT - bright overlay for tapped field
+            // Heading arrow
+            if overlay is HeadingArrowOverlay {
+                return HeadingArrowRenderer(overlay: overlay)
+            }
+            
+            // Selected field highlight
             if let polygon = overlay as? MKPolygon, polygon.title == "SELECTED_FIELD" {
                 let r = MKPolygonRenderer(polygon: polygon)
                 r.strokeColor = UIColor.systemYellow
@@ -981,17 +987,17 @@ struct SpatialMapView: UIViewRepresentable {
                 return r
             }
             
-            // COMPOSITE FIELD OVERLAY - single renderer for all 2,009 polygons!
+            // Composite field overlay
             if let composite = overlay as? CompositeFieldOverlay {
                 return CompositeFieldRenderer(overlay: composite)
             }
             
-            // COMPOSITE POLYLINE OVERLAY - single renderer for all 757 polylines!
+            // Composite polyline overlay
             if let composite = overlay as? CompositePolylineOverlay {
                 return CompositePolylineRenderer(overlay: composite)
             }
             
-            // Spatial overlays using TitledOverlay wrapper (boundaries + selected polyline)
+            // Titled overlays (boundaries + selected polyline)
             if let titled = overlay as? TitledOverlay {
                 switch titled.layerType {
                 case .boundary:
@@ -1007,11 +1013,9 @@ struct SpatialMapView: UIViewRepresentable {
                         r.lineWidth = 3
                         return r
                     }
-                    
                 case .polyline:
                     if let polyline = titled.wrappedOverlay as? MKPolyline {
                         let r = MKPolylineRenderer(polyline: polyline)
-                        // Selected polyline = bright yellow, normal = cyan
                         if titled.identifier == "SELECTED_POLYLINE" {
                             r.strokeColor = UIColor.systemYellow
                             r.lineWidth = 4
@@ -1021,7 +1025,6 @@ struct SpatialMapView: UIViewRepresentable {
                         }
                         return r
                     }
-                    
                 default:
                     break
                 }
@@ -1033,7 +1036,7 @@ struct SpatialMapView: UIViewRepresentable {
     }
 }
 
-// MARK: - Layer Types
+// MARK: - Supporting Types (shared)
 
 enum SpatialLayerType {
     case boundary
@@ -1042,8 +1045,6 @@ enum SpatialLayerType {
     case pointSite
     case stormDrain
 }
-
-// MARK: - Titled Overlay (wrapper for identification)
 
 class TitledOverlay: NSObject, MKOverlay {
     let wrappedOverlay: MKOverlay
@@ -1061,8 +1062,6 @@ class TitledOverlay: NSObject, MKOverlay {
     var coordinate: CLLocationCoordinate2D { wrappedOverlay.coordinate }
     var boundingMapRect: MKMapRect { wrappedOverlay.boundingMapRect }
 }
-
-// MARK: - Spatial Annotation (for points)
 
 class SpatialAnnotation: NSObject, MKAnnotation {
     let coordinate: CLLocationCoordinate2D
@@ -1084,30 +1083,23 @@ class SpatialAnnotation: NSObject, MKAnnotation {
     var markerImage: UIImage {
         let size = CGSize(width: 20, height: 20)
         let renderer = UIGraphicsImageRenderer(size: size)
-        
         return renderer.image { context in
             let ctx = context.cgContext
             let uiColor = UIColor(Color(hex: color))
-            
             switch layerType {
             case .pointSite:
-                // Circle with fill
                 uiColor.setFill()
                 UIColor.white.setStroke()
                 ctx.setLineWidth(1.5)
                 ctx.fillEllipse(in: CGRect(x: 2, y: 2, width: 16, height: 16))
                 ctx.strokeEllipse(in: CGRect(x: 2, y: 2, width: 16, height: 16))
-                
             case .stormDrain:
-                // Small square
                 uiColor.setFill()
                 UIColor.white.setStroke()
                 ctx.setLineWidth(1)
                 ctx.fill(CGRect(x: 4, y: 4, width: 12, height: 12))
                 ctx.stroke(CGRect(x: 4, y: 4, width: 12, height: 12))
-                
             default:
-                // Default circle
                 uiColor.setFill()
                 ctx.fillEllipse(in: CGRect(x: 2, y: 2, width: 16, height: 16))
             }
@@ -1115,49 +1107,8 @@ class SpatialAnnotation: NSObject, MKAnnotation {
     }
 }
 
-// MARK: - Location Manager
-
-class LocationManager: NSObject, ObservableObject {
-    private let manager = CLLocationManager()
-    
-    @Published var location: CLLocation?
-    @Published var hasLocation: Bool = false
-    @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
-    
-    override init() {
-        super.init()
-        manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyBest
-    }
-    
-    func requestPermission() {
-        manager.requestWhenInUseAuthorization()
-    }
-    
-    func startUpdating() {
-        manager.startUpdatingLocation()
-    }
-}
-
-extension LocationManager: CLLocationManagerDelegate {
-    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        location = locations.last
-        hasLocation = location != nil
-    }
-    
-    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        authorizationStatus = manager.authorizationStatus
-        if authorizationStatus == .authorizedWhenInUse || authorizationStatus == .authorizedAlways {
-            startUpdating()
-        }
-    }
-}
-
-// MARK: - Marker Annotation (existing)
-
 class MarkerAnnotation: NSObject, MKAnnotation {
     let marker: FieldMarker
-    
     var coordinate: CLLocationCoordinate2D { marker.coordinate }
     var title: String? { nil }
     
@@ -1168,28 +1119,22 @@ class MarkerAnnotation: NSObject, MKAnnotation {
     var markerImage: UIImage {
         let size = CGSize(width: 24, height: 24)
         let renderer = UIGraphicsImageRenderer(size: size)
-        
         return renderer.image { context in
             let ctx = context.cgContext
-            
             if let larvae = marker.larvae {
-                // Dot for larvae
                 let color = UIColor(Color(hex: LarvaeLevel(rawValue: larvae)?.color ?? "#2e8b57"))
                 color.setFill()
                 ctx.fillEllipse(in: CGRect(x: 6, y: 6, width: 12, height: 12))
-                
                 if marker.pupaePresent {
                     UIColor.systemPink.setStroke()
                     ctx.setLineWidth(2)
                     ctx.strokeEllipse(in: CGRect(x: 4, y: 4, width: 16, height: 16))
                 }
             } else if let family = marker.family {
-                // Diamond for treatment
                 let colorHex = marker.status == "OBSERVED" ? "#2e8b57" : (TreatmentFamily(rawValue: family)?.color ?? "#ffca28")
                 let color = UIColor(Color(hex: colorHex))
                 color.setStroke()
                 ctx.setLineWidth(2)
-                
                 let path = UIBezierPath()
                 path.move(to: CGPoint(x: 12, y: 2))
                 path.addLine(to: CGPoint(x: 22, y: 12))
@@ -1201,8 +1146,6 @@ class MarkerAnnotation: NSObject, MKAnnotation {
         }
     }
 }
-
-// MARK: - Selected Feature
 
 enum SelectedFeature {
     case field(FieldPolygon)
@@ -1229,24 +1172,20 @@ enum SelectedFeature {
     }
 }
 
-// MARK: - Feature Info View
-
 struct FeatureInfoView: View {
     let feature: SelectedFeature
+    @ObservedObject var treatmentStatusService = TreatmentStatusService.shared
     @Environment(\.dismiss) var dismiss
     
     var body: some View {
         NavigationView {
             List {
+                treatmentStatusSection
                 switch feature {
-                case .field(let field):
-                    fieldInfo(field)
-                case .polyline(let line):
-                    polylineInfo(line)
-                case .pointSite(let site):
-                    pointSiteInfo(site)
-                case .stormDrain(let drain):
-                    stormDrainInfo(drain)
+                case .field(let field): fieldInfo(field)
+                case .polyline(let line): polylineInfo(line)
+                case .pointSite(let site): pointSiteInfo(site)
+                case .stormDrain(let drain): stormDrainInfo(drain)
                 }
             }
             .navigationTitle(feature.title)
@@ -1260,131 +1199,112 @@ struct FeatureInfoView: View {
     }
     
     @ViewBuilder
+    private var treatmentStatusSection: some View {
+        let featureId: String = {
+            switch feature {
+            case .field(let f): return f.id
+            case .polyline(let p): return p.id
+            case .pointSite(let s): return s.id
+            case .stormDrain(let d): return d.id
+            }
+        }()
+        let status = treatmentStatusService.statusForFeature(featureId)
+        Section("Treatment Status") {
+            HStack {
+                Circle().fill(Color(hex: status.color)).frame(width: 16, height: 16)
+                Text(status.statusText).font(.headline).foregroundColor(statusTextColor(status.color))
+                if status.isLocalOverride {
+                    Spacer()
+                    Text("⏳ pending sync").font(.caption).foregroundColor(.secondary)
+                }
+            }
+            if let daysSince = status.daysSince { infoRow("Days Since Treatment", "\(daysSince)") }
+            infoRow("Last Treated", status.formattedLastTreated)
+            if let by = status.lastTreatedBy { infoRow("Treated By", by) }
+            if let chemical = status.lastChemical { infoRow("Chemical", chemical) }
+            infoRow("Cycle", "\(status.cycleDays) days")
+        }
+    }
+    
+    private func statusTextColor(_ hex: String) -> Color {
+        switch hex {
+        case TreatmentColors.fresh: return .green
+        case TreatmentColors.recent: return .yellow
+        case TreatmentColors.aging: return .orange
+        case TreatmentColors.overdue, TreatmentColors.never: return .red
+        default: return .primary
+        }
+    }
+    
+    @ViewBuilder
     private func fieldInfo(_ field: FieldPolygon) -> some View {
         Section("Identification") {
-            if let name = field.name {
-                infoRow("Name", name)
-            }
-            if let zone = field.zone {
-                infoRow("Zone", zone)
-            }
-            if let zone2 = field.zone2 {
-                infoRow("Zone 2", zone2)
-            }
+            if let name = field.name { infoRow("Name", name) }
+            if let zone = field.zone { infoRow("Zone", zone) }
+            if let zone2 = field.zone2 { infoRow("Zone 2", zone2) }
             infoRow("ID", field.id)
         }
-        
         Section("Details") {
-            if let habitat = field.habitat {
-                infoRow("Habitat", habitat)
-            }
-            if let priority = field.priority {
-                infoRow("Priority", priority)
-            }
-            if let useType = field.use_type {
-                infoRow("Use Type", useType)
-            }
-            if let acres = field.acres {
-                infoRow("Acres", String(format: "%.2f", acres))
-            }
-            if let active = field.active {
-                infoRow("Active", active ? "Yes" : "No")
-            }
+            if let habitat = field.habitat { infoRow("Habitat", habitat) }
+            if let priority = field.priority { infoRow("Priority", priority) }
+            if let useType = field.use_type { infoRow("Use Type", useType) }
+            if let acres = field.acres { infoRow("Acres", String(format: "%.2f", acres)) }
+            if let active = field.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
     
     @ViewBuilder
     private func polylineInfo(_ line: SpatialPolyline) -> some View {
         Section("Identification") {
-            if let name = line.name {
-                infoRow("Name", name)
-            }
-            if let zone = line.zone {
-                infoRow("Zone", zone)
-            }
-            if let zone2 = line.zone2 {
-                infoRow("Zone 2", zone2)
-            }
+            if let name = line.name { infoRow("Name", name) }
+            if let zone = line.zone { infoRow("Zone", zone) }
+            if let zone2 = line.zone2 { infoRow("Zone 2", zone2) }
             infoRow("ID", line.id)
         }
-        
         Section("Details") {
-            if let habitat = line.habitat {
-                infoRow("Habitat", habitat)
-            }
-            if let length = line.length_ft {
-                infoRow("Length", String(format: "%.0f ft", length))
-            }
-            if let width = line.width_ft {
-                infoRow("Width", String(format: "%.1f ft", width))
-            }
-            if let active = line.active {
-                infoRow("Active", active ? "Yes" : "No")
-            }
+            if let habitat = line.habitat { infoRow("Habitat", habitat) }
+            if let length = line.length_ft { infoRow("Length", String(format: "%.0f ft", length)) }
+            if let width = line.width_ft { infoRow("Width", String(format: "%.1f ft", width)) }
+            if let active = line.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
     
     @ViewBuilder
     private func pointSiteInfo(_ site: PointSite) -> some View {
         Section("Identification") {
-            if let name = site.name {
-                infoRow("Name", name)
-            }
-            if let zone = site.zone {
-                infoRow("Zone", zone)
-            }
-            if let zone2 = site.zone2 {
-                infoRow("Zone 2", zone2)
-            }
+            if let name = site.name { infoRow("Name", name) }
+            if let zone = site.zone { infoRow("Zone", zone) }
+            if let zone2 = site.zone2 { infoRow("Zone 2", zone2) }
             infoRow("ID", site.id)
         }
-        
         Section("Details") {
-            if let habitat = site.habitat {
-                infoRow("Habitat", habitat)
-            }
-            if let priority = site.priority {
-                infoRow("Priority", priority)
-            }
-            if let active = site.active {
-                infoRow("Active", active ? "Yes" : "No")
-            }
+            if let habitat = site.habitat { infoRow("Habitat", habitat) }
+            if let priority = site.priority { infoRow("Priority", priority) }
+            if let active = site.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
     
     @ViewBuilder
     private func stormDrainInfo(_ drain: StormDrain) -> some View {
         Section("Identification") {
-            if let name = drain.name {
-                infoRow("Name", name)
-            }
-            if let zone = drain.zone {
-                infoRow("Zone", zone)
-            }
-            if let zone2 = drain.zone2 {
-                infoRow("Zone 2", zone2)
-            }
+            if let name = drain.name { infoRow("Name", name) }
+            if let zone = drain.zone { infoRow("Zone", zone) }
+            if let zone2 = drain.zone2 { infoRow("Zone 2", zone2) }
             infoRow("ID", drain.id)
         }
-        
         Section("Details") {
-            if let symbology = drain.symbology {
-                infoRow("Status", symbology)
-            }
+            if let symbology = drain.symbology { infoRow("Status", symbology) }
         }
     }
     
     private func infoRow(_ label: String, _ value: String) -> some View {
         HStack {
-            Text(label)
-                .foregroundColor(.secondary)
+            Text(label).foregroundColor(.secondary)
             Spacer()
             Text(value)
         }
     }
 }
-
-// MARK: - Preview
 
 #Preview {
     FieldMapView()

@@ -30,14 +30,20 @@ class SpatialHitTester {
         polylines: [SpatialPolyline],
         pointSites: [PointSite],
         stormDrains: [StormDrain],
-        mapView: MKMapView
+        mapView: MKMapView?
     ) -> SelectedFeature? {
         
         // Calculate tap tolerance in degrees based on current zoom
         // At high zoom, be precise. At low zoom, be more forgiving.
-        let visibleSpan = mapView.region.span
-        let screenTapFraction = 0.03  // ~3% of visible width = tap target
-        let tapToleranceDegrees = visibleSpan.latitudeDelta * screenTapFraction
+        let tapToleranceDegrees: Double
+        if let mapView = mapView {
+            let visibleSpan = mapView.region.span
+            let screenTapFraction = 0.03  // ~3% of visible width = tap target
+            tapToleranceDegrees = visibleSpan.latitudeDelta * screenTapFraction
+        } else {
+            // Default tolerance when no mapView (e.g., treatment drop hit test)
+            tapToleranceDegrees = 0.001  // ~100m
+        }
         
         var candidates: [HitTestResult] = []
         
