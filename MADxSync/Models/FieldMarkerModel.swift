@@ -430,7 +430,7 @@ class MarkerStore: ObservableObject {
             throw MarkerSyncError.invalidURL
         }
         
-        let payload = marker.toSupabasePayload(deviceId: deviceId, truckId: nil)
+        let payload = marker.toSupabasePayload(deviceId: deviceId, truckId: TruckService.shared.selectedTruckId)
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

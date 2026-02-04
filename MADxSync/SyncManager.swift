@@ -28,8 +28,8 @@ class SyncManager: ObservableObject {
     
     // MARK: - Local Storage
     private var pendingData: [PendingSync] = []
-    private var truckSlug: String?
-    
+    private let pendingFileURL: URL
+        
     // MARK: - Network Monitor
     private let monitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "NetworkMonitor")
@@ -38,6 +38,9 @@ class SyncManager: ObservableObject {
     private var floPollingTimer: Timer?
     
     init() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        pendingFileURL = docs.appendingPathComponent("pending_syncs.json")
+        migrateFromUserDefaults()
         loadPendingFromDisk()
         startNetworkMonitor()
         startFLOPolling()
@@ -149,7 +152,6 @@ class SyncManager: ObservableObject {
                 
                 floConnected = true
                 truckName = ssid
-                truckSlug = toSlug(ssid)
                 floStatus = "Connected"
             } else {
                 floConnected = true
@@ -175,8 +177,8 @@ class SyncManager: ObservableObject {
             return
         }
         
-        guard let slug = truckSlug else {
-            log("❌ No truck identified")
+        guard TruckService.shared.hasTruckSelected else {
+            log("❌ No truck selected — pick a truck in Settings first")
             return
         }
         
@@ -215,7 +217,7 @@ class SyncManager: ObservableObject {
                 
                 // Store locally
                 let pending = PendingSync(
-                    truckSlug: slug,
+                    truckId: TruckService.shared.selectedTruckId!,
                     fileName: file.name,
                     tableName: tableName,
                     rows: rows,
@@ -265,12 +267,7 @@ class SyncManager: ObservableObject {
         
         for pending in pendingData {
             do {
-                // Look up truck ID from Supabase
-                guard let truckId = try await lookupTruckId(slug: pending.truckSlug) else {
-                    log("⚠️ Truck '\(pending.truckSlug)' not found")
-                    failedItems.append(pending)
-                    continue
-                }
+                let truckId = pending.truckId
                 
                 // Convert CodableValue back to Any
                 let convertedRows: [[String: Any]] = pending.rows.map { row in
@@ -311,28 +308,7 @@ class SyncManager: ObservableObject {
         updateSyncStatus()
     }
     
-    // MARK: - Truck Lookup
-    private func lookupTruckId(slug: String) async throws -> String? {
-        guard let url = URL(string: "\(supabaseURL)/rest/v1/trucks?slug=eq.\(slug)&select=id") else {
-            return nil
-        }
-        
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 15
-        request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        
-        let (data, _) = try await URLSession.shared.data(for: request)
-        print("Truck lookup response: \(String(data: data, encoding: .utf8) ?? "no data")")
-        
-        if let trucks = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-           let truck = trucks.first,
-           let id = truck["id"] as? String {
-            return id
-        }
-        
-        return nil
-    }
+    
     
     // MARK: - FLO API Calls
     private func getFileList() async throws -> [FLOFile] {
@@ -463,20 +439,53 @@ class SyncManager: ObservableObject {
         return rows.count
     }
     
-    // MARK: - Local Storage (UserDefaults for simplicity)
+    // MARK: - Local Storage (file-based)
     private func savePendingToDisk() {
-        let encoder = JSONEncoder()
-        if let data = try? encoder.encode(pendingData) {
-            UserDefaults.standard.set(data, forKey: "pendingSync")
+        do {
+            let data = try JSONEncoder().encode(pendingData)
+            try data.write(to: pendingFileURL, options: .atomic)
+        } catch {
+            print("[SyncManager] ⚠️ Failed to save pending data: \(error)")
         }
         pendingFiles = pendingData.count
     }
-    
+
     private func loadPendingFromDisk() {
-        if let data = UserDefaults.standard.data(forKey: "pendingSync"),
-           let pending = try? JSONDecoder().decode([PendingSync].self, from: data) {
+        do {
+            let data = try Data(contentsOf: pendingFileURL)
+            let pending = try JSONDecoder().decode([PendingSync].self, from: data)
             pendingData = pending
             pendingFiles = pending.count
+        } catch {
+            // File doesn't exist yet or decode failed — start fresh
+            pendingData = []
+            pendingFiles = 0
+        }
+    }
+
+    /// One-time migration: move pending data from UserDefaults to file storage
+    private func migrateFromUserDefaults() {
+        guard let legacyData = UserDefaults.standard.data(forKey: "pendingSync") else {
+            return  // Nothing to migrate
+        }
+        
+        // Only migrate if the file doesn't already exist
+        guard !FileManager.default.fileExists(atPath: pendingFileURL.path) else {
+            // File already exists, just clean up the old key
+            UserDefaults.standard.removeObject(forKey: "pendingSync")
+            print("[SyncManager] Cleaned up legacy UserDefaults key")
+            return
+        }
+        
+        do {
+            // Verify it's valid data before migrating
+            _ = try JSONDecoder().decode([PendingSync].self, from: legacyData)
+            try legacyData.write(to: pendingFileURL, options: .atomic)
+            UserDefaults.standard.removeObject(forKey: "pendingSync")
+            print("[SyncManager] ✓ Migrated pending data from UserDefaults to file storage")
+        } catch {
+            // Don't delete from UserDefaults if file write failed — data is preserved
+            print("[SyncManager] ⚠️ Migration failed, keeping UserDefaults data: \(error)")
         }
     }
     
@@ -490,14 +499,6 @@ class SyncManager: ObservableObject {
         }
     }
     
-    // MARK: - Helpers
-    private func toSlug(_ input: String) -> String {
-        return input
-            .lowercased()
-            .trimmingCharacters(in: .whitespaces)
-            .replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-    }
     
     private func log(_ message: String) {
         let formatter = DateFormatter()
@@ -516,14 +517,14 @@ struct FLOFile {
 }
 
 struct PendingSync: Codable {
-    let truckSlug: String
+    let truckId: String
     let fileName: String
     let tableName: String
     let rows: [[String: CodableValue]]
     let downloadedAt: Date
     
-    init(truckSlug: String, fileName: String, tableName: String, rows: [[String: Any]], downloadedAt: Date) {
-        self.truckSlug = truckSlug
+    init(truckId: String, fileName: String, tableName: String, rows: [[String: Any]], downloadedAt: Date) {
+        self.truckId = truckId
         self.fileName = fileName
         self.tableName = tableName
         self.downloadedAt = downloadedAt

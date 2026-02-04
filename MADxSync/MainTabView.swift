@@ -35,6 +35,8 @@ struct MainTabView: View {
 // MARK: - Settings View
 struct SettingsView: View {
     @ObservedObject private var floService = FLOService.shared
+    @ObservedObject private var truckService = TruckService.shared
+    @State private var showTruckPicker = false
     @State private var isDownloadingMaps = false
     @State private var downloadProgress: Double = 0
     @State private var downloadError: String?
@@ -43,6 +45,28 @@ struct SettingsView: View {
     var body: some View {
         NavigationView {
             List {
+                // Truck Identity
+                    Section(header: Text("Truck")) {
+                        HStack {
+                            Image(systemName: "truck.box.fill")
+                                .foregroundColor(.blue)
+                            Text(TruckService.shared.selectedTruckName ?? "Not Selected")
+                                .fontWeight(.medium)
+                            Spacer()
+                            if let num = TruckService.shared.selectedTruckNumber {
+                                Text("#\(num)")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        
+                        Button(action: { showTruckPicker = true }) {
+                            HStack {
+                                Image(systemName: "arrow.triangle.2.circlepath")
+                                Text("Switch Truck")
+                            }
+                        }
+                    }
+                
                 // FLO Connection
                 Section(header: Text("FLO Hardware")) {
                     HStack {
@@ -232,6 +256,9 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
+            .sheet(isPresented: $showTruckPicker) {
+                TruckPickerView(isSheet: true)
+            }
         }
     }
     

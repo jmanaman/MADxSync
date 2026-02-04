@@ -35,8 +35,16 @@ class SpatialService: ObservableObject {
     private let cacheKeyPointSites = "spatial_pointsites"
     private let cacheKeyStormDrains = "spatial_stormdrains"
     private let cacheKeyLastSync = "spatial_last_sync"
-    
+    private let cacheDir: URL
+
     init() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        cacheDir = docs.appendingPathComponent("spatial_cache", isDirectory: true)
+        
+        // Create cache directory if needed
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        
+        migrateFromUserDefaults()
         loadFromCache()
     }
     
@@ -147,26 +155,51 @@ class SpatialService: ObservableObject {
         }
     }
     
+    /// One-time migration: move spatial cache from UserDefaults to file storage
+    private func migrateFromUserDefaults() {
+        // Check if legacy data exists
+        guard UserDefaults.standard.data(forKey: cacheKeyBoundaries) != nil else {
+            return  // Nothing to migrate
+        }
+        
+        print("[SpatialService] Migrating cache from UserDefaults to file storage...")
+        
+        let migrations: [(String, String)] = [
+            (cacheKeyBoundaries, "boundaries.json"),
+            (cacheKeyFields, "fields.json"),
+            (cacheKeyPolylines, "polylines.json"),
+            (cacheKeyPointSites, "pointsites.json"),
+            (cacheKeyStormDrains, "stormdrains.json")
+        ]
+        
+        for (key, filename) in migrations {
+            if let data = UserDefaults.standard.data(forKey: key) {
+                try? data.write(to: cacheDir.appendingPathComponent(filename), options: .atomic)
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        
+        print("[SpatialService] ✓ Migrated spatial cache to file storage")
+    }
+    
     // MARK: - Caching
     
     private func saveToCache() {
         let encoder = JSONEncoder()
         
-        if let data = try? encoder.encode(boundaries) {
-            UserDefaults.standard.set(data, forKey: cacheKeyBoundaries)
+        func writeCache<T: Encodable>(_ items: T, filename: String) {
+            if let data = try? encoder.encode(items) {
+                try? data.write(to: cacheDir.appendingPathComponent(filename), options: .atomic)
+            }
         }
-        if let data = try? encoder.encode(fields) {
-            UserDefaults.standard.set(data, forKey: cacheKeyFields)
-        }
-        if let data = try? encoder.encode(polylines) {
-            UserDefaults.standard.set(data, forKey: cacheKeyPolylines)
-        }
-        if let data = try? encoder.encode(pointSites) {
-            UserDefaults.standard.set(data, forKey: cacheKeyPointSites)
-        }
-        if let data = try? encoder.encode(stormDrains) {
-            UserDefaults.standard.set(data, forKey: cacheKeyStormDrains)
-        }
+        
+        writeCache(boundaries, filename: "boundaries.json")
+        writeCache(fields, filename: "fields.json")
+        writeCache(polylines, filename: "polylines.json")
+        writeCache(pointSites, filename: "pointsites.json")
+        writeCache(stormDrains, filename: "stormdrains.json")
+        
+        // lastSync is tiny — fine in UserDefaults
         if let lastSync = lastSync {
             UserDefaults.standard.set(lastSync, forKey: cacheKeyLastSync)
         }
@@ -177,26 +210,17 @@ class SpatialService: ObservableObject {
     private func loadFromCache() {
         let decoder = JSONDecoder()
         
-        if let data = UserDefaults.standard.data(forKey: cacheKeyBoundaries),
-           let decoded = try? decoder.decode([DistrictBoundary].self, from: data) {
-            boundaries = decoded
+        func readCache<T: Decodable>(_ type: T.Type, filename: String) -> T? {
+            guard let data = try? Data(contentsOf: cacheDir.appendingPathComponent(filename)) else { return nil }
+            return try? decoder.decode(type, from: data)
         }
-        if let data = UserDefaults.standard.data(forKey: cacheKeyFields),
-           let decoded = try? decoder.decode([FieldPolygon].self, from: data) {
-            fields = decoded
-        }
-        if let data = UserDefaults.standard.data(forKey: cacheKeyPolylines),
-           let decoded = try? decoder.decode([SpatialPolyline].self, from: data) {
-            polylines = decoded
-        }
-        if let data = UserDefaults.standard.data(forKey: cacheKeyPointSites),
-           let decoded = try? decoder.decode([PointSite].self, from: data) {
-            pointSites = decoded
-        }
-        if let data = UserDefaults.standard.data(forKey: cacheKeyStormDrains),
-           let decoded = try? decoder.decode([StormDrain].self, from: data) {
-            stormDrains = decoded
-        }
+        
+        boundaries = readCache([DistrictBoundary].self, filename: "boundaries.json") ?? []
+        fields = readCache([FieldPolygon].self, filename: "fields.json") ?? []
+        polylines = readCache([SpatialPolyline].self, filename: "polylines.json") ?? []
+        pointSites = readCache([PointSite].self, filename: "pointsites.json") ?? []
+        stormDrains = readCache([StormDrain].self, filename: "stormdrains.json") ?? []
+        
         if let date = UserDefaults.standard.object(forKey: cacheKeyLastSync) as? Date {
             lastSync = date
         }
@@ -207,11 +231,8 @@ class SpatialService: ObservableObject {
     // MARK: - Clear Cache
     
     func clearCache() {
-        UserDefaults.standard.removeObject(forKey: cacheKeyBoundaries)
-        UserDefaults.standard.removeObject(forKey: cacheKeyFields)
-        UserDefaults.standard.removeObject(forKey: cacheKeyPolylines)
-        UserDefaults.standard.removeObject(forKey: cacheKeyPointSites)
-        UserDefaults.standard.removeObject(forKey: cacheKeyStormDrains)
+        try? FileManager.default.removeItem(at: cacheDir)
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         UserDefaults.standard.removeObject(forKey: cacheKeyLastSync)
         
         boundaries = []

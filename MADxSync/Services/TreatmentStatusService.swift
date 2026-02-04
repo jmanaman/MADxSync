@@ -72,10 +72,15 @@ class TreatmentStatusService: ObservableObject {
     private let cacheKeyStatus = "treatment_status_cache"
     private let cacheKeyOverrides = "treatment_local_overrides"
     private let cacheKeyLastSync = "treatment_last_sync"
-    
+    private let cacheDir: URL
+
     // MARK: - Init
-    
+
     init() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        cacheDir = docs.appendingPathComponent("treatment_cache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+        migrateFromUserDefaults()
         loadFromCache()
     }
     
@@ -346,10 +351,31 @@ class TreatmentStatusService: ObservableObject {
     
     // MARK: - Cache
     
+    /// One-time migration: move treatment cache from UserDefaults to file storage
+    private func migrateFromUserDefaults() {
+        guard UserDefaults.standard.data(forKey: cacheKeyStatus) != nil else {
+            return
+        }
+        
+        print("[HubTreatmentStatus] Migrating cache from UserDefaults to file storage...")
+        
+        if let data = UserDefaults.standard.data(forKey: cacheKeyStatus) {
+            try? data.write(to: cacheDir.appendingPathComponent("statuses.json"), options: .atomic)
+            UserDefaults.standard.removeObject(forKey: cacheKeyStatus)
+        }
+        
+        if let data = UserDefaults.standard.data(forKey: cacheKeyOverrides) {
+            try? data.write(to: cacheDir.appendingPathComponent("overrides.json"), options: .atomic)
+            UserDefaults.standard.removeObject(forKey: cacheKeyOverrides)
+        }
+        
+        print("[HubTreatmentStatus] ✓ Migrated treatment cache to file storage")
+    }
+    
     private func saveToCache() {
         let encoder = JSONEncoder()
         if let data = try? encoder.encode(Array(statusByFeature.values)) {
-            UserDefaults.standard.set(data, forKey: cacheKeyStatus)
+            try? data.write(to: cacheDir.appendingPathComponent("statuses.json"), options: .atomic)
         }
         if let date = lastSync {
             UserDefaults.standard.set(date, forKey: cacheKeyLastSync)
@@ -359,14 +385,14 @@ class TreatmentStatusService: ObservableObject {
     private func saveOverridesToCache() {
         let encoder = JSONEncoder()
         if let data = try? encoder.encode(localOverrides) {
-            UserDefaults.standard.set(data, forKey: cacheKeyOverrides)
+            try? data.write(to: cacheDir.appendingPathComponent("overrides.json"), options: .atomic)
         }
     }
     
     private func loadFromCache() {
         let decoder = JSONDecoder()
         
-        if let data = UserDefaults.standard.data(forKey: cacheKeyStatus),
+        if let data = try? Data(contentsOf: cacheDir.appendingPathComponent("statuses.json")),
            let statuses = try? decoder.decode([HubTreatmentStatus].self, from: data) {
             var lookup: [String: HubTreatmentStatus] = [:]
             for status in statuses {
@@ -375,7 +401,7 @@ class TreatmentStatusService: ObservableObject {
             statusByFeature = lookup
         }
         
-        if let data = UserDefaults.standard.data(forKey: cacheKeyOverrides),
+        if let data = try? Data(contentsOf: cacheDir.appendingPathComponent("overrides.json")),
            let overrides = try? decoder.decode([String: LocalTreatment].self, from: data) {
             localOverrides = overrides
         }
