@@ -153,7 +153,7 @@ enum LarvaeLevel: String, CaseIterable, Identifiable {
 }
 
 // MARK: - Field Marker
-/// A marker placed on the map representing a treatment, inspection, or observation
+/// A marker placed on the map representing a treatment, inspection, observation, or note
 struct FieldMarker: Identifiable, Codable {
     let id: UUID
     let timestamp: Date
@@ -175,6 +175,9 @@ struct FieldMarker: Identifiable, Codable {
     // Notes
     var notes: String?
     
+    // Note tool — field note destined for source_notes table
+    var noteText: String?
+    
     // Sync tracking
     var syncedToFLO: Bool
     var syncedToSupabase: Bool
@@ -190,7 +193,8 @@ struct FieldMarker: Identifiable, Codable {
         trapNumber: String? = nil,
         larvae: String? = nil,
         pupaePresent: Bool = false,
-        notes: String? = nil
+        notes: String? = nil,
+        noteText: String? = nil
     ) {
         self.id = UUID()
         self.timestamp = Date()
@@ -205,6 +209,7 @@ struct FieldMarker: Identifiable, Codable {
         self.larvae = larvae
         self.pupaePresent = pupaePresent
         self.notes = notes
+        self.noteText = noteText
         self.syncedToFLO = false
         self.syncedToSupabase = false
     }
@@ -222,12 +227,19 @@ struct FieldMarker: Identifiable, Codable {
     
     /// Marker type for database
     var markerType: String {
-        if family != nil {
+        if noteText != nil {
+            return "NOTE"
+        } else if family != nil {
             return "TREATMENT"
         } else if larvae != nil {
             return "LARVAE"
         }
         return "UNKNOWN"
+    }
+    
+    /// Whether this marker is a field note (routes to source_notes)
+    var isNote: Bool {
+        noteText != nil
     }
     
     /// Generate payload for FLO's /viewer_log/add endpoint
@@ -269,6 +281,12 @@ struct FieldMarker: Identifiable, Codable {
             payloadData["pupae"] = pupaePresent ? 1 : 0
         }
         
+        // If this is a note marker
+        if let noteText = noteText {
+            payload["type"] = "FIELD_NOTE"
+            payloadData["note"] = noteText
+        }
+        
         payload["payload"] = payloadData
         return payload
     }
@@ -306,6 +324,26 @@ struct FieldMarker: Identifiable, Codable {
         return payload
     }
     
+    /// Generate payload for Supabase source_notes table (field notes)
+    func toSourceNotePayload(truckId: String? = nil) -> [String: Any] {
+        var payload: [String: Any] = [
+            "district_id": "2f05ab6e-dacb-4af5-b5d2-0156aa8b58ce",
+            "note": noteText ?? "",
+            "lat": lat,
+            "lon": lon,
+            "created_by": "app",
+            "created_at": timestampISO
+        ]
+        
+        if let truckId = truckId {
+            payload["truck_id"] = truckId
+        }
+        
+        // source_type and source_id left nil — Hub auto-attaches
+        
+        return payload
+    }
+    
     /// Generate CSV row matching FLO's viewer_log format
     func toCSVRow() -> String {
         var action = ""
@@ -319,6 +357,9 @@ struct FieldMarker: Identifiable, Codable {
             if let trapNumber = trapNumber { action += " trapNumber=\(trapNumber)" }
         } else if let larvae = larvae {
             action = "FIELD_LARVA larva=\(larvae) pupae=\(pupaePresent ? 1 : 0)"
+        } else if let noteText = noteText {
+            let safeNote = noteText.replacingOccurrences(of: ",", with: " ")
+            action = "FIELD_NOTE note=\(safeNote)"
         }
         
         action += " lat=\(lat) lon=\(lon)"
@@ -335,6 +376,9 @@ struct FieldMarker: Identifiable, Codable {
 
 // MARK: - Marker Store
 /// In-memory store for markers with local persistence and Supabase sync
+extension Notification.Name {
+   static let markerAdded = Notification.Name("markerAdded")
+}
 @MainActor
 class MarkerStore: ObservableObject {
     static let shared = MarkerStore()
@@ -377,6 +421,7 @@ class MarkerStore: ObservableObject {
         markers.append(marker)
         updatePendingCount()
         saveMarkers()
+        NotificationCenter.default.post(name: .markerAdded, object: marker)
         
         // Auto-sync to Supabase
         Task {
@@ -413,7 +458,7 @@ class MarkerStore: ObservableObject {
             do {
                 try await uploadMarker(marker)
                 markSyncedToSupabase(marker.id)
-                print("[MarkerStore] ✓ Synced marker \(marker.id)")
+                print("[MarkerStore] ✓ Synced \(marker.markerType.lowercased()) \(marker.id)")
             } catch {
                 print("[MarkerStore] ✗ Failed to sync marker: \(error)")
                 lastSyncError = error.localizedDescription
@@ -426,6 +471,16 @@ class MarkerStore: ObservableObject {
     
     // MARK: - Upload Single Marker
     private func uploadMarker(_ marker: FieldMarker) async throws {
+        // Route notes to source_notes, everything else to app_markers
+        if marker.isNote {
+            try await uploadNote(marker)
+        } else {
+            try await uploadAppMarker(marker)
+        }
+    }
+    
+    /// Upload a treatment or larvae marker to app_markers
+    private func uploadAppMarker(_ marker: FieldMarker) async throws {
         guard let url = URL(string: "\(supabaseURL)/rest/v1/app_markers") else {
             throw MarkerSyncError.invalidURL
         }
@@ -450,6 +505,50 @@ class MarkerStore: ObservableObject {
         
         // 201 = created, 409 = duplicate (already exists, that's fine)
         guard (200...299).contains(httpResponse.statusCode) || httpResponse.statusCode == 409 else {
+            throw MarkerSyncError.uploadFailed(statusCode: httpResponse.statusCode)
+        }
+    }
+    
+    /// Upload a field note to source_notes
+    private func uploadNote(_ marker: FieldMarker) async throws {
+        guard let url = URL(string: "\(supabaseURL)/rest/v1/source_notes") else {
+            throw MarkerSyncError.invalidURL
+        }
+        
+        let payload = marker.toSourceNotePayload(truckId: TruckService.shared.selectedTruckId)
+        
+        // Log what we're sending
+        if let jsonDebug = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted),
+           let jsonString = String(data: jsonDebug, encoding: .utf8) {
+            print("[MarkerStore] 📝 Uploading note to source_notes:")
+            print(jsonString)
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 15
+        request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("return=minimal", forHTTPHeaderField: "Prefer")
+        
+        let jsonData = try JSONSerialization.data(withJSONObject: payload)
+        request.httpBody = jsonData
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw MarkerSyncError.noResponse
+        }
+        
+        // Log response details for debugging
+        print("[MarkerStore] 📝 source_notes response: \(httpResponse.statusCode)")
+        if let responseBody = String(data: data, encoding: .utf8), !responseBody.isEmpty {
+            print("[MarkerStore] 📝 Response body: \(responseBody)")
+        }
+        
+        guard (200...299).contains(httpResponse.statusCode) || httpResponse.statusCode == 409 else {
+            let errorBody = String(data: data, encoding: .utf8) ?? "no body"
+            print("[MarkerStore] ✗ Note upload FAILED: \(httpResponse.statusCode) — \(errorBody)")
             throw MarkerSyncError.uploadFailed(statusCode: httpResponse.statusCode)
         }
     }

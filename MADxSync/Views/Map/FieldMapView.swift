@@ -6,6 +6,8 @@
 //
 //  UPDATED: Uses CompositeFieldOverlay for memory-efficient polygon rendering
 //  UPDATED: NavigationService replaces LocationManager - adds heading arrow + follow mode
+//  UPDATED: Note tool added — field notes sync to source_notes table
+//  UPDATED: Snap to point sites and storm drains
 //
 
 import SwiftUI
@@ -14,11 +16,15 @@ import CoreLocation
 import MapCache
 import Combine
 
+
+
+
 // MARK: - Active Tool State
 enum ActiveTool: Equatable {
     case none
     case treatment
     case larvae
+    case note
 }
 
 /// Main map view with rapid tap-to-drop tools
@@ -49,6 +55,11 @@ struct FieldMapView: View {
     @State private var showLarvaePicker = false
     @State private var pendingLarvaeCoordinate: CLLocationCoordinate2D?
     
+    // Note quick picker
+    @State private var showNotePicker = false
+    @State private var pendingNoteCoordinate: CLLocationCoordinate2D?
+    @State private var noteInputText: String = ""
+    
     // Layer sheet
     @State private var showLayerSheet = false
     
@@ -63,18 +74,28 @@ struct FieldMapView: View {
     @State private var selectedLarvaeLevel: LarvaeLevel = .few
     @State private var pupaeSelected: Bool = false
     
+    // Snap feedback
+    @State private var showSnapToast = false
+    @State private var snapSourceName: String = ""
+    
+    // Force map refresh counter
+    @State private var mapRefreshTrigger: Int = 0
+    
     var body: some View {
         ZStack {
             // Map with spatial layers
             SpatialMapView(
                 region: $mapRegion,
                 markers: markerStore.markers,
+                refreshTrigger: mapRefreshTrigger,
                 spatialService: spatialService,
                 layerVisibility: layerVisibility,
                 treatmentStatusService: treatmentStatusService,
                 navigationService: navigationService,
                 activeTool: activeTool,
-                onTap: handleMapTap,
+                onTap: { coordinate, screenPoint in
+                    handleMapTap(coordinate, screenPoint: screenPoint)
+                },
                 onFeatureSelected: { feature in
                     selectedFeature = feature
                     showFeatureInfo = true
@@ -128,6 +149,16 @@ struct FieldMapView: View {
                 larvaeQuickPicker
                     .transition(.opacity)
             }
+            
+            // Note quick picker modal
+            if showNotePicker {
+                noteQuickPicker
+                    .transition(.opacity)
+            }
+            
+            // Snap toast feedback
+            SnapToastView(sourceName: snapSourceName, isVisible: showSnapToast)
+                .allowsHitTesting(false)
         }
         .onAppear {
             navigationService.requestPermission()
@@ -158,20 +189,55 @@ struct FieldMapView: View {
     }
     
     // MARK: - Handle Map Tap
-    private func handleMapTap(_ coordinate: CLLocationCoordinate2D) {
+    private func handleMapTap(_ coordinate: CLLocationCoordinate2D, screenPoint: CGPoint) {
+        // Check for snap to point sites or storm drains
+        let snapResult = SnapService.checkSnap(
+            coordinate: coordinate,
+            pointSites: spatialService.pointSites,
+            stormDrains: spatialService.stormDrains
+        )
+        
+        // Use snapped coordinate if available, otherwise original
+        let finalCoordinate = snapResult?.coordinate ?? coordinate
+        
+        // Show toast if snapped (only for treatment tool)
+        if let snap = snapResult, activeTool == .treatment {
+            snapSourceName = snap.sourceName
+            withAnimation(.easeOut(duration: 0.2)) {
+                showSnapToast = true
+            }
+            
+            let impact = UIImpactFeedbackGenerator(style: .rigid)
+            impact.impactOccurred()
+            
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                withAnimation(.easeIn(duration: 0.2)) {
+                    showSnapToast = false
+                }
+            }
+        } else if snapResult != nil {
+            // Just haptic for larvae/note snap
+            let impact = UIImpactFeedbackGenerator(style: .rigid)
+            impact.impactOccurred()
+        }
+        
         switch activeTool {
         case .none:
             break
         case .treatment:
-            dropTreatmentMarker(at: coordinate)
+            dropTreatmentMarker(at: finalCoordinate, snappedTo: snapResult)
         case .larvae:
-            pendingLarvaeCoordinate = coordinate
+            pendingLarvaeCoordinate = finalCoordinate
             showLarvaePicker = true
+        case .note:
+            pendingNoteCoordinate = finalCoordinate
+            noteInputText = ""
+            showNotePicker = true
         }
     }
     
     // MARK: - Drop Treatment Marker (instant)
-    private func dropTreatmentMarker(at coordinate: CLLocationCoordinate2D) {
+    private func dropTreatmentMarker(at coordinate: CLLocationCoordinate2D, snappedTo: SnapResult? = nil) {
         let marker = FieldMarker(
             lat: coordinate.latitude,
             lon: coordinate.longitude,
@@ -186,39 +252,49 @@ struct FieldMapView: View {
         
         // Both TREATED and OBSERVED reset the treatment clock (turn green)
         if treatmentStatus == .treated || treatmentStatus == .observed {
-            let hitFeature = SpatialHitTester.hitTest(
-                coordinate: coordinate,
-                fields: spatialService.fields,
-                polylines: spatialService.polylines,
-                pointSites: spatialService.pointSites,
-                stormDrains: spatialService.stormDrains,
-                mapView: nil
-            )
+            var featureId: String? = nil
+            var featureType: String? = nil
             
-            if let feature = hitFeature {
-                let featureId: String
-                let featureType: String
-                switch feature {
-                case .field(let f):
-                    featureId = f.id
-                    featureType = "field"
-                case .polyline(let p):
-                    featureId = p.id
-                    featureType = "polyline"
-                case .pointSite(let s):
-                    featureId = s.id
-                    featureType = "pointsite"
-                case .stormDrain(let d):
-                    featureId = d.id
-                    featureType = "stormdrain"
-                }
+            // If we snapped to a point site or storm drain, use that directly
+            if let snap = snappedTo {
+                featureId = snap.sourceId
+                featureType = snap.sourceType
+            } else {
+                // Otherwise do hit test for polygons/polylines
+                let hitFeature = SpatialHitTester.hitTest(
+                    coordinate: coordinate,
+                    fields: spatialService.fields,
+                    polylines: spatialService.polylines,
+                    pointSites: spatialService.pointSites,
+                    stormDrains: spatialService.stormDrains,
+                    mapView: nil
+                )
                 
+                if let feature = hitFeature {
+                    switch feature {
+                    case .field(let f):
+                        featureId = f.id
+                        featureType = "field"
+                    case .polyline(let p):
+                        featureId = p.id
+                        featureType = "polyline"
+                    case .pointSite(let s):
+                        featureId = s.id
+                        featureType = "pointsite"
+                    case .stormDrain(let d):
+                        featureId = d.id
+                        featureType = "stormdrain"
+                    }
+                }
+            }
+            
+            if let fId = featureId, let fType = featureType {
                 treatmentStatusService.markTreatedLocally(
-                    featureId: featureId,
-                    featureType: featureType,
+                    featureId: fId,
+                    featureType: fType,
                     chemical: selectedChemical
                 )
-                treatedFeatureStack.append(featureId)
+                treatedFeatureStack.append(fId)
             } else {
                 treatedFeatureStack.append("")
             }
@@ -265,6 +341,38 @@ struct FieldMapView: View {
         
         showLarvaePicker = false
         pendingLarvaeCoordinate = nil
+        
+        // Force map to refresh
+        mapRefreshTrigger += 1
+    }
+    
+    // MARK: - Drop Note Marker
+    private func dropNoteMarker() {
+        guard let coordinate = pendingNoteCoordinate else { return }
+        guard !noteInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        
+        let marker = FieldMarker(
+            lat: coordinate.latitude,
+            lon: coordinate.longitude,
+            noteText: noteInputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        
+        markerStore.addMarker(marker)
+        
+        // Notes don't affect treatment status — no feature stack tracking needed
+        treatedFeatureStack.append("")
+        
+        let impact = UIImpactFeedbackGenerator(style: .light)
+        impact.impactOccurred()
+        
+        // Notes don't push to FLO viewer_log — they go to source_notes only
+        
+        showNotePicker = false
+        pendingNoteCoordinate = nil
+        noteInputText = ""
+        
+        // Force map to refresh
+        mapRefreshTrigger += 1
     }
     
     // MARK: - Dose Presets by Unit
@@ -405,6 +513,7 @@ struct FieldMapView: View {
     // MARK: - Tool FAB Column
     private var toolFABColumn: some View {
         VStack(spacing: 12) {
+            // Treatment tool
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.15)) {
                     activeTool = activeTool == .treatment ? .none : .treatment
@@ -419,6 +528,7 @@ struct FieldMapView: View {
                     .shadow(radius: 4)
             }
             
+            // Larvae tool
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.15)) {
                     activeTool = activeTool == .larvae ? .none : .larvae
@@ -432,6 +542,22 @@ struct FieldMapView: View {
                     .shadow(radius: 4)
             }
             
+            // Note tool
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    activeTool = activeTool == .note ? .none : .note
+                }
+            }) {
+                Image(systemName: "note.text")
+                    .font(.title2)
+                    .foregroundColor(activeTool == .note ? .white : .orange)
+                    .frame(width: 56, height: 56)
+                    .background(activeTool == .note ? Color.orange : Color(.systemBackground))
+                    .clipShape(Circle())
+                    .shadow(radius: 4)
+            }
+            
+            // Undo
             if !markerStore.markers.isEmpty {
                 Button(action: undoLastMarker) {
                     Image(systemName: "arrow.uturn.backward")
@@ -443,6 +569,87 @@ struct FieldMapView: View {
                         .shadow(radius: 2)
                 }
             }
+        }
+    }
+    
+    // MARK: - Note Quick Picker
+    private var noteQuickPicker: some View {
+        ZStack {
+            Color.black.opacity(0.4)
+                .edgesIgnoringSafeArea(.all)
+                .onTapGesture {
+                    showNotePicker = false
+                    pendingNoteCoordinate = nil
+                    noteInputText = ""
+                }
+            
+            VStack(spacing: 16) {
+                HStack {
+                    Image(systemName: "note.text")
+                        .font(.title2)
+                        .foregroundColor(.orange)
+                    Text("Field Note")
+                        .font(.headline)
+                }
+                
+                if let coord = pendingNoteCoordinate {
+                    Text(String(format: "%.5f, %.5f", coord.latitude, coord.longitude))
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(.secondary)
+                }
+                
+                TextEditor(text: $noteInputText)
+                    .frame(height: 100)
+                    .padding(8)
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(8)
+                    .overlay(
+                        Group {
+                            if noteInputText.isEmpty {
+                                Text("Enter note...")
+                                    .foregroundColor(.secondary)
+                                    .padding(.leading, 12)
+                                    .padding(.top, 16)
+                                    .allowsHitTesting(false)
+                            }
+                        },
+                        alignment: .topLeading
+                    )
+                
+                HStack(spacing: 16) {
+                    Button("Cancel") {
+                        showNotePicker = false
+                        pendingNoteCoordinate = nil
+                        noteInputText = ""
+                    }
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                    
+                    Button(action: dropNoteMarker) {
+                        HStack {
+                            Image(systemName: "checkmark")
+                            Text("Save")
+                        }
+                        .font(.headline)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 10)
+                        .background(
+                            noteInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? Color.gray
+                                : Color.orange
+                        )
+                        .cornerRadius(10)
+                    }
+                    .disabled(noteInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+            .padding(24)
+            .background(Color(.systemBackground))
+            .cornerRadius(16)
+            .shadow(radius: 10)
+            .padding(32)
         }
     }
     
@@ -575,12 +782,12 @@ struct FieldMapView: View {
             
             // Active tool indicator
             if activeTool != .none {
-                Text(activeTool == .treatment ? "TAP TO DROP 💧" : "TAP FOR LARVAE 🦟")
+                Text(toolIndicatorText)
                     .font(.caption.bold())
                     .foregroundColor(.white)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
-                    .background(activeTool == .treatment ? Color.blue : Color.green)
+                    .background(toolIndicatorColor)
                     .cornerRadius(12)
             }
             
@@ -598,6 +805,24 @@ struct FieldMapView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(.ultraThinMaterial)
+    }
+    
+    private var toolIndicatorText: String {
+        switch activeTool {
+        case .none: return ""
+        case .treatment: return "TAP TO DROP 💧"
+        case .larvae: return "TAP FOR LARVAE 🦟"
+        case .note: return "TAP TO NOTE 📝"
+        }
+    }
+    
+    private var toolIndicatorColor: Color {
+        switch activeTool {
+        case .none: return .clear
+        case .treatment: return .blue
+        case .larvae: return .green
+        case .note: return .orange
+        }
     }
     
     private func headingCardinal(_ degrees: CLLocationDirection) -> String {
@@ -623,16 +848,18 @@ struct FieldMapView: View {
 struct SpatialMapView: UIViewRepresentable {
     @Binding var region: MKCoordinateRegion
     let markers: [FieldMarker]
+    let refreshTrigger: Int  // <-- Added to force updates
     @ObservedObject var spatialService: SpatialService
     @ObservedObject var layerVisibility: LayerVisibility
     @ObservedObject var treatmentStatusService: TreatmentStatusService
     @ObservedObject var navigationService: NavigationService
     let activeTool: ActiveTool
-    let onTap: (CLLocationCoordinate2D) -> Void
+    let onTap: (CLLocationCoordinate2D, CGPoint) -> Void
     let onFeatureSelected: (SelectedFeature) -> Void
     
     func makeUIView(context: Context) -> MKMapView {
         let mapView = MKMapView()
+        context.coordinator.mapViewRef = mapView
         mapView.delegate = context.coordinator
         // We draw our own heading arrow — don't use MapKit's blue dot
         mapView.showsUserLocation = false
@@ -652,10 +879,11 @@ struct SpatialMapView: UIViewRepresentable {
         context.coordinator.parent = self
         context.coordinator.updateCount += 1
         
-        // Force SwiftUI to track nav changes for re-render
+        // Force SwiftUI to track these for re-render
         let _ = navigationService.location
         let _ = navigationService.heading
         let _ = navigationService.isFollowing
+        let _ = refreshTrigger  // <-- Track refresh trigger
         
         context.coordinator.updateSpatialLayers(mapView: mapView)
         context.coordinator.updateMarkers(mapView: mapView, markers: markers)
@@ -669,7 +897,9 @@ struct SpatialMapView: UIViewRepresentable {
     class Coordinator: NSObject, MKMapViewDelegate {
         var parent: SpatialMapView
         var updateCount = 0
-        
+        weak var mapViewRef: MKMapView?
+        private var markerObserver: Any?
+        private var justAddedViaNotification: Set<UUID> = []
         private var currentBoundaryIds: Set<String> = []
         private var hasFieldOverlay = false
         private var hasPolylineOverlay = false
@@ -682,12 +912,38 @@ struct SpatialMapView: UIViewRepresentable {
         
         init(_ parent: SpatialMapView) {
             self.parent = parent
+            super.init()
+            
+            markerObserver = NotificationCenter.default.addObserver(
+                forName: .markerAdded, object: nil, queue: .main
+            ) { [weak self] notification in
+                guard let self,
+                      let marker = notification.object as? FieldMarker,
+                      let mapView = self.mapViewRef else { return }
+                
+                self.justAddedViaNotification.insert(marker.id)
+                let annotation = MarkerAnnotation(marker: marker)
+                mapView.addAnnotation(annotation)
+                
+                // Force annotation to appear by selecting and deselecting it
+                mapView.selectAnnotation(annotation, animated: false)
+                mapView.deselectAnnotation(annotation, animated: false)
+            }
+        }
+
+        deinit {
+            if let observer = markerObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
         }
         
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
             guard let mapView = gesture.view as? MKMapView else { return }
             let point = gesture.location(in: mapView)
             let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
+            
+            // Convert to screen coordinates for overlay positioning
+            let screenPoint = gesture.location(in: mapView.superview ?? mapView)
             
             let service = parent.spatialService
             let visibility = parent.layerVisibility
@@ -703,15 +959,18 @@ struct SpatialMapView: UIViewRepresentable {
             )
             
             if toolActive {
+                // Dismiss any open annotation callouts
+                mapView.selectedAnnotations.forEach { mapView.deselectAnnotation($0, animated: false) }
+                
                 removeSelectionHighlight(mapView: mapView)
-                parent.onTap(coordinate)
+                parent.onTap(coordinate, screenPoint)
             } else {
                 if let feature = feature {
                     parent.onFeatureSelected(feature)
                     addSelectionHighlight(feature: feature, mapView: mapView)
                 } else {
                     removeSelectionHighlight(mapView: mapView)
-                    parent.onTap(coordinate)
+                    parent.onTap(coordinate, screenPoint)
                 }
             }
         }
@@ -930,8 +1189,14 @@ struct SpatialMapView: UIViewRepresentable {
             let existingIds = Set(existingAnnotations.map { $0.marker.id })
             let newIds = Set(markers.map { $0.id })
             
-            let toRemove = existingAnnotations.filter { !newIds.contains($0.marker.id) }
+            // Don't remove markers just added via notification
+            let toRemove = existingAnnotations.filter {
+                !newIds.contains($0.marker.id) && !justAddedViaNotification.contains($0.marker.id)
+            }
             if !toRemove.isEmpty { mapView.removeAnnotations(toRemove) }
+            
+            // Clear the protection for IDs that are now in the markers array
+            justAddedViaNotification = justAddedViaNotification.subtracting(newIds)
             
             let idsToAdd = newIds.subtracting(existingIds)
             let toAdd = markers.filter { idsToAdd.contains($0.id) }
@@ -945,18 +1210,6 @@ struct SpatialMapView: UIViewRepresentable {
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if annotation is MKUserLocation { return nil }
             
-            if let spatial = annotation as? SpatialAnnotation {
-                let identifier = "SpatialAnnotation"
-                var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier)
-                if view == nil {
-                    view = MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
-                    view?.canShowCallout = true
-                }
-                view?.annotation = annotation
-                view?.image = spatial.markerImage
-                return view
-            }
-            
             if let markerAnnotation = annotation as? MarkerAnnotation {
                 let identifier = "FieldMarker"
                 var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier)
@@ -966,6 +1219,18 @@ struct SpatialMapView: UIViewRepresentable {
                 }
                 view?.annotation = annotation
                 view?.image = markerAnnotation.markerImage
+                return view
+            }
+            
+            if let spatial = annotation as? SpatialAnnotation {
+                let identifier = "SpatialAnnotation"
+                var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier)
+                if view == nil {
+                    view = MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
+                    view?.canShowCallout = true
+                }
+                view?.annotation = annotation
+                view?.image = spatial.markerImage
                 return view
             }
             
@@ -1121,6 +1386,34 @@ class MarkerAnnotation: NSObject, MKAnnotation {
         let renderer = UIGraphicsImageRenderer(size: size)
         return renderer.image { context in
             let ctx = context.cgContext
+            
+            // Note marker — flag shape
+            if marker.isNote {
+                // Flag pole
+                UIColor.orange.setStroke()
+                ctx.setLineWidth(2)
+                ctx.move(to: CGPoint(x: 6, y: 4))
+                ctx.addLine(to: CGPoint(x: 6, y: 22))
+                ctx.strokePath()
+                
+                // Flag body
+                UIColor.orange.setFill()
+                let flagPath = UIBezierPath()
+                flagPath.move(to: CGPoint(x: 6, y: 4))
+                flagPath.addLine(to: CGPoint(x: 20, y: 7))
+                flagPath.addLine(to: CGPoint(x: 6, y: 12))
+                flagPath.close()
+                flagPath.fill()
+                
+                // White outline for visibility
+                UIColor.white.setStroke()
+                ctx.setLineWidth(1)
+                flagPath.stroke()
+                
+                return
+            }
+            
+            // Larvae marker — colored dot
             if let larvae = marker.larvae {
                 let color = UIColor(Color(hex: LarvaeLevel(rawValue: larvae)?.color ?? "#2e8b57"))
                 color.setFill()
@@ -1130,7 +1423,9 @@ class MarkerAnnotation: NSObject, MKAnnotation {
                     ctx.setLineWidth(2)
                     ctx.strokeEllipse(in: CGRect(x: 4, y: 4, width: 16, height: 16))
                 }
-            } else if let family = marker.family {
+            }
+            // Treatment marker — diamond outline
+            else if let family = marker.family {
                 let colorHex = marker.status == "OBSERVED" ? "#2e8b57" : (TreatmentFamily(rawValue: family)?.color ?? "#ffca28")
                 let color = UIColor(Color(hex: colorHex))
                 color.setStroke()
