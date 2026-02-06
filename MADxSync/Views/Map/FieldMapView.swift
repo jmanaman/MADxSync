@@ -900,13 +900,16 @@ struct SpatialMapView: UIViewRepresentable {
         weak var mapViewRef: MKMapView?
         private var markerObserver: Any?
         private var justAddedViaNotification: Set<UUID> = []
+        
         private var currentBoundaryIds: Set<String> = []
         private var hasFieldOverlay = false
         private var hasPolylineOverlay = false
-        private var currentPointSiteIds: Set<String> = []
-        private var currentStormDrainIds: Set<String> = []
+        private var hasPointSiteOverlay = false
+        private var hasStormDrainOverlay = false
         private var lastFieldCount = 0
         private var lastPolylineCount = 0
+        private var lastPointSiteCount = 0
+        private var lastStormDrainCount = 0
         private var lastStatusVersion = 0
         private var hasHeadingOverlay = false
         
@@ -930,7 +933,7 @@ struct SpatialMapView: UIViewRepresentable {
                 mapView.deselectAnnotation(annotation, animated: false)
             }
         }
-
+        
         deinit {
             if let observer = markerObserver {
                 NotificationCenter.default.removeObserver(observer)
@@ -1143,43 +1146,51 @@ struct SpatialMapView: UIViewRepresentable {
         }
         
         private func updatePointSites(mapView: MKMapView, show: Bool, data: [PointSite]) {
-            let newIds = show ? Set(data.map { $0.id }) : []
+            let dataChanged = data.count != lastPointSiteCount
+            let visibilityChanged = show != hasPointSiteOverlay
             let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
-            if newIds != currentPointSiteIds || statusChanged {
-                let toRemove = mapView.annotations.filter { ($0 as? SpatialAnnotation)?.layerType == .pointSite }
-                mapView.removeAnnotations(toRemove)
-                if show {
-                    let statusService = parent.treatmentStatusService
-                    for site in data {
-                        if let coord = site.coordinate {
-                            let color = statusService.colorForFeature(site.id)
-                            let annotation = SpatialAnnotation(coordinate: coord, type: .pointSite, id: site.id, title: site.displayName, color: color)
-                            mapView.addAnnotation(annotation)
-                        }
-                    }
-                }
-                currentPointSiteIds = newIds
+            guard dataChanged || visibilityChanged || statusChanged else { return }
+            
+            // Remove existing overlay
+            let toRemove = mapView.overlays.filter {
+                ($0 as? CompositePointOverlay)?.pointType == .pointSite
             }
+            if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
+            
+            if show && !data.isEmpty {
+                let statusService = parent.treatmentStatusService
+                let composite = CompositePointOverlay(pointSites: data) { featureId in
+                    statusService.colorForFeature(featureId)
+                }
+                mapView.addOverlay(composite, level: .aboveLabels)
+            }
+            
+            hasPointSiteOverlay = show && !data.isEmpty
+            lastPointSiteCount = data.count
         }
         
         private func updateStormDrains(mapView: MKMapView, show: Bool, data: [StormDrain]) {
-            let newIds = show ? Set(data.map { $0.id }) : []
+            let dataChanged = data.count != lastStormDrainCount
+            let visibilityChanged = show != hasStormDrainOverlay
             let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
-            if newIds != currentStormDrainIds || statusChanged {
-                let toRemove = mapView.annotations.filter { ($0 as? SpatialAnnotation)?.layerType == .stormDrain }
-                mapView.removeAnnotations(toRemove)
-                if show {
-                    let statusService = parent.treatmentStatusService
-                    for drain in data {
-                        if let coord = drain.coordinate {
-                            let color = statusService.colorForFeature(drain.id)
-                            let annotation = SpatialAnnotation(coordinate: coord, type: .stormDrain, id: drain.id, title: drain.name, color: color)
-                            mapView.addAnnotation(annotation)
-                        }
-                    }
-                }
-                currentStormDrainIds = newIds
+            guard dataChanged || visibilityChanged || statusChanged else { return }
+            
+            // Remove existing overlay
+            let toRemove = mapView.overlays.filter {
+                ($0 as? CompositePointOverlay)?.pointType == .stormDrain
             }
+            if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
+            
+            if show && !data.isEmpty {
+                let statusService = parent.treatmentStatusService
+                let composite = CompositePointOverlay(stormDrains: data) { featureId in
+                    statusService.colorForFeature(featureId)
+                }
+                mapView.addOverlay(composite, level: .aboveLabels)
+            }
+            
+            hasStormDrainOverlay = show && !data.isEmpty
+            lastStormDrainCount = data.count
         }
         
         // MARK: - Update Markers
@@ -1189,9 +1200,11 @@ struct SpatialMapView: UIViewRepresentable {
             let existingIds = Set(existingAnnotations.map { $0.marker.id })
             let newIds = Set(markers.map { $0.id })
             
-            // Don't remove markers just added via notification
+            // Only remove if marker was deleted (not in store anymore)
+            // Don't remove markers that exist on map but aren't in the passed array yet
+            let markersInStore = Set(MarkerStore.shared.markers.map { $0.id })
             let toRemove = existingAnnotations.filter {
-                !newIds.contains($0.marker.id) && !justAddedViaNotification.contains($0.marker.id)
+                !markersInStore.contains($0.marker.id) && !justAddedViaNotification.contains($0.marker.id)
             }
             if !toRemove.isEmpty { mapView.removeAnnotations(toRemove) }
             
@@ -1222,17 +1235,8 @@ struct SpatialMapView: UIViewRepresentable {
                 return view
             }
             
-            if let spatial = annotation as? SpatialAnnotation {
-                let identifier = "SpatialAnnotation"
-                var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier)
-                if view == nil {
-                    view = MKAnnotationView(annotation: annotation, reuseIdentifier: identifier)
-                    view?.canShowCallout = true
-                }
-                view?.annotation = annotation
-                view?.image = spatial.markerImage
-                return view
-            }
+            // SpatialAnnotations are no longer used - point sites and storm drains
+            // are now rendered via CompositePointOverlay for better performance
             
             return nil
         }
@@ -1260,6 +1264,11 @@ struct SpatialMapView: UIViewRepresentable {
             // Composite polyline overlay
             if let composite = overlay as? CompositePolylineOverlay {
                 return CompositePolylineRenderer(overlay: composite)
+            }
+            
+            // Composite point overlay (point sites and storm drains)
+            if let composite = overlay as? CompositePointOverlay {
+                return CompositePointRenderer(overlay: composite)
             }
             
             // Titled overlays (boundaries + selected polyline)
@@ -1300,7 +1309,6 @@ struct SpatialMapView: UIViewRepresentable {
         }
     }
 }
-
 // MARK: - Supporting Types (shared)
 
 enum SpatialLayerType {
