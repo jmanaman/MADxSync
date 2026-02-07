@@ -16,15 +16,13 @@ import CoreLocation
 import MapCache
 import Combine
 
-
-
-
 // MARK: - Active Tool State
 enum ActiveTool: Equatable {
     case none
     case treatment
     case larvae
     case note
+    case navigate
 }
 
 /// Main map view with rapid tap-to-drop tools
@@ -33,6 +31,7 @@ struct FieldMapView: View {
     @StateObject private var spatialService = SpatialService.shared
     @StateObject private var layerVisibility = LayerVisibility()
     @StateObject private var treatmentStatusService = TreatmentStatusService.shared
+    @StateObject private var routeService = RouteService.shared
     @ObservedObject private var floService = FLOService.shared
     @ObservedObject private var markerStore = MarkerStore.shared
     
@@ -81,6 +80,9 @@ struct FieldMapView: View {
     // Force map refresh counter
     @State private var mapRefreshTrigger: Int = 0
     
+    // Navigation route
+    @State private var showRoutePolyline: Bool = false
+    
     var body: some View {
         ZStack {
             // Map with spatial layers
@@ -92,6 +94,7 @@ struct FieldMapView: View {
                 layerVisibility: layerVisibility,
                 treatmentStatusService: treatmentStatusService,
                 navigationService: navigationService,
+                routeService: routeService,
                 activeTool: activeTool,
                 onTap: { coordinate, screenPoint in
                     handleMapTap(coordinate, screenPoint: screenPoint)
@@ -118,6 +121,12 @@ struct FieldMapView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
+                
+                // Navigation banner (when navigating to a source)
+                NavigationBannerView(routeService: routeService) {
+                    routeService.cancelNavigation()
+                    activeTool = .none
+                }
                 
                 // Context strip (when treatment tool active)
                 if activeTool == .treatment {
@@ -162,6 +171,7 @@ struct FieldMapView: View {
         }
         .onAppear {
             navigationService.requestPermission()
+            routeService.setNavigationService(navigationService)
             
             if !spatialService.hasData {
                 Task {
@@ -184,6 +194,13 @@ struct FieldMapView: View {
             if let feature = selectedFeature {
                 FeatureInfoView(feature: feature)
                     .presentationDetents([.medium, .large])
+            }
+        }
+        .onChange(of: routeService.hasArrived) { arrived in
+            if arrived {
+                let impact = UIImpactFeedbackGenerator(style: .heavy)
+                impact.impactOccurred()
+                impact.impactOccurred()  // Double tap for emphasis
             }
         }
     }
@@ -233,6 +250,22 @@ struct FieldMapView: View {
             pendingNoteCoordinate = finalCoordinate
             noteInputText = ""
             showNotePicker = true
+        case .navigate:
+            // Hit test to find what source was tapped
+            let feature = SpatialHitTester.hitTest(
+                coordinate: finalCoordinate,
+                fields: spatialService.fields,
+                polylines: spatialService.polylines,
+                pointSites: spatialService.pointSites,
+                stormDrains: spatialService.stormDrains,
+                mapView: nil
+            )
+            
+            if let feature = feature {
+                Task {
+                    await startNavigation(to: feature)
+                }
+            }
         }
     }
     
@@ -373,6 +406,64 @@ struct FieldMapView: View {
         
         // Force map to refresh
         mapRefreshTrigger += 1
+    }
+    
+    // MARK: - Start Navigation
+    private func startNavigation(to feature: SelectedFeature) async {
+        let coordinate: CLLocationCoordinate2D
+        let name: String
+        let type: String
+        let id: String
+        
+        switch feature {
+        case .field(let f):
+            // Use centroid of field
+            if let centroid = f.centroid {
+                coordinate = centroid
+            } else {
+                return
+            }
+            name = f.displayName
+            type = "field"
+            id = f.id
+            
+        case .polyline(let p):
+            // Use midpoint of polyline
+            if let midpoint = p.midpoint {
+                coordinate = midpoint
+            } else {
+                return
+            }
+            name = p.name ?? "Ditch/Canal"
+            type = "polyline"
+            id = p.id
+            
+        case .pointSite(let s):
+            guard let coord = s.coordinate else { return }
+            coordinate = coord
+            name = s.displayName
+            type = "pointsite"
+            id = s.id
+            
+        case .stormDrain(let d):
+            guard let coord = d.coordinate else { return }
+            coordinate = coord
+            name = d.name ?? "Storm Drain"
+            type = "stormdrain"
+            id = d.id
+        }
+        
+        // Haptic feedback
+        let impact = UIImpactFeedbackGenerator(style: .medium)
+        impact.impactOccurred()
+        
+        // Start navigation
+        await routeService.navigateTo(
+            coordinate: coordinate,
+            name: name,
+            type: type,
+            id: id
+        )
     }
     
     // MARK: - Dose Presets by Unit
@@ -553,6 +644,26 @@ struct FieldMapView: View {
                     .foregroundColor(activeTool == .note ? .white : .orange)
                     .frame(width: 56, height: 56)
                     .background(activeTool == .note ? Color.orange : Color(.systemBackground))
+                    .clipShape(Circle())
+                    .shadow(radius: 4)
+            }
+            
+            // Navigate tool
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    if activeTool == .navigate {
+                        activeTool = .none
+                        routeService.cancelNavigation()
+                    } else {
+                        activeTool = .navigate
+                    }
+                }
+            }) {
+                Image(systemName: "location.circle.fill")
+                    .font(.title2)
+                    .foregroundColor(activeTool == .navigate ? .white : .purple)
+                    .frame(width: 56, height: 56)
+                    .background(activeTool == .navigate ? Color.purple : Color(.systemBackground))
                     .clipShape(Circle())
                     .shadow(radius: 4)
             }
@@ -813,6 +924,7 @@ struct FieldMapView: View {
         case .treatment: return "TAP TO DROP 💧"
         case .larvae: return "TAP FOR LARVAE 🦟"
         case .note: return "TAP TO NOTE 📝"
+        case .navigate: return "TAP SOURCE TO NAVIGATE 🧭"
         }
     }
     
@@ -822,6 +934,7 @@ struct FieldMapView: View {
         case .treatment: return .blue
         case .larvae: return .green
         case .note: return .orange
+        case .navigate: return .purple
         }
     }
     
@@ -853,6 +966,7 @@ struct SpatialMapView: UIViewRepresentable {
     @ObservedObject var layerVisibility: LayerVisibility
     @ObservedObject var treatmentStatusService: TreatmentStatusService
     @ObservedObject var navigationService: NavigationService
+    @ObservedObject var routeService: RouteService
     let activeTool: ActiveTool
     let onTap: (CLLocationCoordinate2D, CGPoint) -> Void
     let onFeatureSelected: (SelectedFeature) -> Void
@@ -888,6 +1002,7 @@ struct SpatialMapView: UIViewRepresentable {
         context.coordinator.updateSpatialLayers(mapView: mapView)
         context.coordinator.updateMarkers(mapView: mapView, markers: markers)
         context.coordinator.updateNavigation(mapView: mapView)
+        context.coordinator.updateRouteOverlay(mapView: mapView, routePolyline: routeService.routePolyline)
     }
     
     func makeCoordinator() -> Coordinator {
@@ -912,6 +1027,7 @@ struct SpatialMapView: UIViewRepresentable {
         private var lastStormDrainCount = 0
         private var lastStatusVersion = 0
         private var hasHeadingOverlay = false
+        private var hasRouteOverlay = false
         
         init(_ parent: SpatialMapView) {
             self.parent = parent
@@ -1052,6 +1168,23 @@ struct SpatialMapView: UIViewRepresentable {
             let toRemove = mapView.overlays.filter { $0 is HeadingArrowOverlay }
             if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
             hasHeadingOverlay = false
+        }
+        
+        // MARK: - Route Overlay
+        
+        func updateRouteOverlay(mapView: MKMapView, routePolyline: MKPolyline?) {
+            // Remove existing route
+            let toRemove = mapView.overlays.filter { $0 is MKPolyline && ($0 as? MKPolyline)?.title == "ROUTE" }
+            if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
+            
+            // Add new route if present
+            if let polyline = routePolyline {
+                polyline.title = "ROUTE"
+                mapView.addOverlay(polyline, level: .aboveLabels)
+                hasRouteOverlay = true
+            } else {
+                hasRouteOverlay = false
+            }
         }
         
         // MARK: - Detect User Pan (disable follow)
@@ -1253,6 +1386,14 @@ struct SpatialMapView: UIViewRepresentable {
                 r.strokeColor = UIColor.systemYellow
                 r.fillColor = UIColor.systemYellow.withAlphaComponent(0.25)
                 r.lineWidth = 3
+                return r
+            }
+            
+            // Route polyline (navigation)
+            if let polyline = overlay as? MKPolyline, polyline.title == "ROUTE" {
+                let r = MKPolylineRenderer(polyline: polyline)
+                r.strokeColor = UIColor.systemBlue
+                r.lineWidth = 6
                 return r
             }
             

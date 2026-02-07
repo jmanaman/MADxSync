@@ -34,6 +34,7 @@ struct MainTabView: View {
 
 // MARK: - Settings View
 struct SettingsView: View {
+    @EnvironmentObject var authService: AuthService
     @ObservedObject private var floService = FLOService.shared
     @ObservedObject private var truckService = TruckService.shared
     @State private var showTruckPicker = false
@@ -41,31 +42,69 @@ struct SettingsView: View {
     @State private var downloadProgress: Double = 0
     @State private var downloadError: String?
     @State private var showDownloadComplete = false
+    @State private var showSignOutConfirm = false
     
     var body: some View {
         NavigationView {
             List {
-                // Truck Identity
-                    Section(header: Text("Truck")) {
+                // District & User
+                Section(header: Text("Account")) {
+                    if let user = authService.currentUser {
                         HStack {
-                            Image(systemName: "truck.box.fill")
-                                .foregroundColor(.blue)
-                            Text(TruckService.shared.selectedTruckName ?? "Not Selected")
+                            Image(systemName: "building.2.fill")
+                                .foregroundColor(.green)
+                            Text(user.districtName ?? "Unknown District")
                                 .fontWeight(.medium)
-                            Spacer()
-                            if let num = TruckService.shared.selectedTruckNumber {
-                                Text("#\(num)")
-                                    .foregroundColor(.secondary)
+                        }
+                        
+                        if let name = user.userName {
+                            HStack {
+                                Image(systemName: "person.fill")
+                                    .foregroundColor(.blue)
+                                Text(name)
                             }
                         }
                         
-                        Button(action: { showTruckPicker = true }) {
+                        HStack {
+                            Image(systemName: "envelope.fill")
+                                .foregroundColor(.secondary)
+                            Text(user.email)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        if let role = user.role {
                             HStack {
-                                Image(systemName: "arrow.triangle.2.circlepath")
-                                Text("Switch Truck")
+                                Image(systemName: "shield.fill")
+                                    .foregroundColor(.purple)
+                                Text(role.capitalized)
+                                    .font(.subheadline)
                             }
                         }
                     }
+                }
+                
+                // Truck Identity
+                Section(header: Text("Truck")) {
+                    HStack {
+                        Image(systemName: "truck.box.fill")
+                            .foregroundColor(.blue)
+                        Text(truckService.selectedTruckName ?? "Not Selected")
+                            .fontWeight(.medium)
+                        Spacer()
+                        if let num = truckService.selectedTruckNumber {
+                            Text("#\(num)")
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
+                    Button(action: { showTruckPicker = true }) {
+                        HStack {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                            Text("Switch Truck")
+                        }
+                    }
+                }
                 
                 // FLO Connection
                 Section(header: Text("FLO Hardware")) {
@@ -176,7 +215,6 @@ struct SettingsView: View {
                 
                 // Data Management
                 Section(header: Text("Data")) {
-                    // Show marker stats
                     HStack {
                         Text("Today's Markers")
                         Spacer()
@@ -216,7 +254,6 @@ struct SettingsView: View {
                         }
                     }
                     
-                    // Only show clear button if there are synced markers to clear
                     if MarkerStore.shared.syncedCount > 0 {
                         Button(role: .destructive, action: clearSyncedMarkers) {
                             HStack {
@@ -226,7 +263,6 @@ struct SettingsView: View {
                         }
                     }
                     
-                    // Warning if unsynced markers exist
                     if MarkerStore.shared.unsyncedCount > 0 {
                         HStack {
                             Image(systemName: "exclamationmark.triangle.fill")
@@ -250,14 +286,33 @@ struct SettingsView: View {
                     HStack {
                         Text("Build Date")
                         Spacer()
-                        Text("Jan 30, 2026")
+                        Text("Feb 6, 2026")
                             .foregroundColor(.secondary)
+                    }
+                }
+                
+                // Sign Out
+                Section {
+                    Button(role: .destructive, action: { showSignOutConfirm = true }) {
+                        HStack {
+                            Image(systemName: "rectangle.portrait.and.arrow.right")
+                            Text("Sign Out")
+                        }
                     }
                 }
             }
             .navigationTitle("Settings")
             .sheet(isPresented: $showTruckPicker) {
                 TruckPickerView(isSheet: true)
+            }
+            .alert("Sign Out?", isPresented: $showSignOutConfirm) {
+                Button("Sign Out", role: .destructive) {
+                    truckService.clearSelection()
+                    authService.signOut()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("You'll need to log in again and select a truck.")
             }
         }
     }
@@ -270,27 +325,21 @@ struct SettingsView: View {
     
     private func clearSyncedMarkers() {
         MarkerStore.shared.clearSyncedMarkers()
-        
         let impact = UIImpactFeedbackGenerator(style: .medium)
         impact.impactOccurred()
     }
     
     private func downloadTulareCounty() {
-        // Reset state
         downloadError = nil
         showDownloadComplete = false
         isDownloadingMaps = true
         downloadProgress = 0
         
-        // Tulare County bounds (roughly)
-        // Center: 36.2077, -119.3473
-        // Span: covers most of the county
         let minLat = 35.7
         let maxLat = 36.7
         let minLon = -119.9
         let maxLon = -118.7
         
-        // Download in background
         Task {
             do {
                 try await downloadMapTiles(
@@ -302,7 +351,6 @@ struct SettingsView: View {
                 await MainActor.run {
                     isDownloadingMaps = false
                     showDownloadComplete = true
-                    
                     let impact = UINotificationFeedbackGenerator()
                     impact.notificationOccurred(.success)
                 }
@@ -310,7 +358,6 @@ struct SettingsView: View {
                 await MainActor.run {
                     isDownloadingMaps = false
                     downloadError = "Download failed: \(error.localizedDescription)"
-                    
                     let impact = UINotificationFeedbackGenerator()
                     impact.notificationOccurred(.error)
                 }
@@ -321,20 +368,17 @@ struct SettingsView: View {
     private func downloadMapTiles(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double, minZoom: Int, maxZoom: Int) async throws {
         let urlTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
         
-        // Calculate total tiles for progress
         var totalTiles = 0
         var downloadedTiles = 0
         
         for zoom in minZoom...maxZoom {
             let minTileX = lonToTileX(minLon, zoom: zoom)
             let maxTileX = lonToTileX(maxLon, zoom: zoom)
-            let minTileY = latToTileY(maxLat, zoom: zoom) // Note: Y is inverted
+            let minTileY = latToTileY(maxLat, zoom: zoom)
             let maxTileY = latToTileY(minLat, zoom: zoom)
-            
             totalTiles += (maxTileX - minTileX + 1) * (maxTileY - minTileY + 1)
         }
         
-        // Download tiles
         for zoom in minZoom...maxZoom {
             let minTileX = lonToTileX(minLon, zoom: zoom)
             let maxTileX = lonToTileX(maxLon, zoom: zoom)
@@ -349,49 +393,37 @@ struct SettingsView: View {
                         .replacingOccurrences(of: "{y}", with: "\(y)")
                     
                     if let url = URL(string: urlString) {
-                        // Download tile (MapCache will cache it automatically via URLSession)
                         let request = URLRequest(url: url)
                         let _ = try? await URLSession.shared.data(for: request)
                     }
                     
                     downloadedTiles += 1
-                    
-                    // Update progress on main thread
                     let progress = Double(downloadedTiles) / Double(totalTiles)
                     await MainActor.run {
                         self.downloadProgress = progress
                     }
-                    
-                    // Small delay to avoid hammering the server
-                    try await Task.sleep(nanoseconds: 50_000_000) // 50ms
+                    try await Task.sleep(nanoseconds: 50_000_000)
                 }
             }
         }
     }
     
-    // Convert longitude to tile X coordinate
     private func lonToTileX(_ lon: Double, zoom: Int) -> Int {
         return Int(floor((lon + 180.0) / 360.0 * pow(2.0, Double(zoom))))
     }
     
-    // Convert latitude to tile Y coordinate
     private func latToTileY(_ lat: Double, zoom: Int) -> Int {
         let latRad = lat * .pi / 180.0
         return Int(floor((1.0 - log(tan(latRad) + 1.0 / cos(latRad)) / .pi) / 2.0 * pow(2.0, Double(zoom))))
     }
     
     private func clearMapCache() {
-        // Clear URLCache
         URLCache.shared.removeAllCachedResponses()
-        
-        // Clear MapCache disk cache if accessible
         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
         if let mapCacheDir = cacheDir?.appendingPathComponent("MapCache") {
             try? FileManager.default.removeItem(at: mapCacheDir)
         }
-        
         showDownloadComplete = false
-        
         let impact = UIImpactFeedbackGenerator(style: .medium)
         impact.impactOccurred()
     }

@@ -3,7 +3,8 @@
 //  MADxSync
 //
 //  Truck identity service — single source of truth for which truck this device is operating as.
-//  Pulls truck list from Supabase `trucks` table, persists tech's selection in UserDefaults.
+//  Pulls truck list from Supabase `trucks` table, filtered by authenticated district.
+//  Persists tech's selection in UserDefaults.
 //  Every marker, every sync, every data point gets stamped with the selected truck_id.
 //
 
@@ -12,11 +13,11 @@ import Combine
 
 /// Represents a truck from the Supabase `trucks` table
 struct Truck: Identifiable, Codable {
-    let id: String           // UUID from Supabase
-    let name: String         // Display name: "Truck 7", "Quink 3", etc.
-    let truckNumber: String  // Short identifier: "7", "Alpha", etc.
-    let floSsid: String?     // FLO WiFi SSID if this truck has FLO hardware, nil otherwise
-    let assignedTech: String? // Optional tech assignment
+    let id: String
+    let name: String
+    let truckNumber: String
+    let floSsid: String?
+    let assignedTech: String?
     let active: Bool
     
     enum CodingKeys: String, CodingKey {
@@ -33,68 +34,46 @@ struct Truck: Identifiable, Codable {
 class TruckService: ObservableObject {
     static let shared = TruckService()
     
-    // MARK: - Published State
-    
-    /// All active trucks fetched from Supabase
     @Published var trucks: [Truck] = []
-    
-    /// Whether we're currently fetching the truck list
     @Published var isLoading = false
-    
-    /// Error message if truck fetch failed
     @Published var errorMessage: String?
     
-    // MARK: - Selected Truck (persisted in UserDefaults)
-    
-    /// The UUID of the currently selected truck, or nil if none selected yet
     @Published var selectedTruckId: String? {
-        didSet {
-            UserDefaults.standard.set(selectedTruckId, forKey: "selectedTruckId")
-        }
+        didSet { UserDefaults.standard.set(selectedTruckId, forKey: "selectedTruckId") }
     }
     
-    /// The display name of the currently selected truck, or nil if none selected
     @Published var selectedTruckName: String? {
-        didSet {
-            UserDefaults.standard.set(selectedTruckName, forKey: "selectedTruckName")
-        }
+        didSet { UserDefaults.standard.set(selectedTruckName, forKey: "selectedTruckName") }
     }
     
-    /// The truck_number of the currently selected truck, or nil if none selected
     @Published var selectedTruckNumber: String? {
-        didSet {
-            UserDefaults.standard.set(selectedTruckNumber, forKey: "selectedTruckNumber")
-        }
+        didSet { UserDefaults.standard.set(selectedTruckNumber, forKey: "selectedTruckNumber") }
     }
     
-    /// Whether a truck has been selected (used to gate app entry)
-    var hasTruckSelected: Bool {
-        selectedTruckId != nil
-    }
-    
-    // MARK: - Supabase Config
+    var hasTruckSelected: Bool { selectedTruckId != nil }
     
     private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
     private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
     
-    // MARK: - Init
-    
     private init() {
-        // Restore persisted selection
         selectedTruckId = UserDefaults.standard.string(forKey: "selectedTruckId")
         selectedTruckName = UserDefaults.standard.string(forKey: "selectedTruckName")
         selectedTruckNumber = UserDefaults.standard.string(forKey: "selectedTruckNumber")
-        
-        print("[TruckService] Restored selection: \(selectedTruckName ?? "none") (id: \(selectedTruckId ?? "nil"))")
+        print("[TruckService] Restored selection: \(selectedTruckName ?? "none")")
     }
     
-    // MARK: - Fetch Trucks from Supabase
+    // MARK: - Fetch Trucks (filtered by district)
     
-    /// Pulls all active trucks from the `trucks` table.
-    /// Call this when showing the truck picker to get the latest fleet.
     func fetchTrucks() async {
-        guard let url = URL(string: "\(supabaseURL)/rest/v1/trucks?active=eq.true&select=id,name,truck_number,flo_ssid,assigned_tech,active&order=truck_number.asc") else {
-            errorMessage = "Invalid Supabase URL"
+        // Get district_id from authenticated user — this is the multi-tenant filter
+        guard let districtId = AuthService.shared.districtId else {
+            errorMessage = "Not authenticated — no district"
+            print("[TruckService] ✗ No district_id available")
+            return
+        }
+        
+        guard let url = URL(string: "\(supabaseURL)/rest/v1/trucks?active=eq.true&district_id=eq.\(districtId)&select=id,name,truck_number,flo_ssid,assigned_tech,active&order=truck_number.asc") else {
+            errorMessage = "Invalid URL"
             return
         }
         
@@ -106,33 +85,68 @@ class TruckService: ObservableObject {
         request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
+        if let token = AuthService.shared.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             
-            guard let httpResponse = response as? HTTPURLResponse else {
-                errorMessage = "No response from server"
-                isLoading = false
-                return
-            }
-            
-            guard (200...299).contains(httpResponse.statusCode) else {
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode) else {
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
                 let body = String(data: data, encoding: .utf8) ?? "unknown"
-                errorMessage = "Server error \(httpResponse.statusCode): \(body)"
-                print("[TruckService] ✗ Fetch failed: \(httpResponse.statusCode) — \(body)")
+                errorMessage = "Server error \(statusCode)"
+                print("[TruckService] ✗ Fetch failed: \(statusCode) — \(body)")
                 isLoading = false
                 return
             }
             
-            let decoder = JSONDecoder()
-            let fetchedTrucks = try decoder.decode([Truck].self, from: data)
+            // Manual JSON parsing — handles type mismatches gracefully
+            guard let jsonArray = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                errorMessage = "Invalid response format"
+                isLoading = false
+                return
+            }
+            
+            var fetchedTrucks: [Truck] = []
+            for truckJson in jsonArray {
+                guard let id = truckJson["id"] as? String,
+                      let name = truckJson["name"] as? String else {
+                    continue
+                }
+                
+                // Handle truck_number as String or Int
+                let truckNumber: String
+                if let tn = truckJson["truck_number"] as? String {
+                    truckNumber = tn
+                } else if let tn = truckJson["truck_number"] as? Int {
+                    truckNumber = String(tn)
+                } else {
+                    truckNumber = "0"
+                }
+                
+                let floSsid = truckJson["flo_ssid"] as? String
+                let assignedTech = truckJson["assigned_tech"] as? String
+                let active = truckJson["active"] as? Bool ?? true
+                
+                fetchedTrucks.append(Truck(
+                    id: id,
+                    name: name,
+                    truckNumber: truckNumber,
+                    floSsid: floSsid,
+                    assignedTech: assignedTech,
+                    active: active
+                ))
+            }
+            
             trucks = fetchedTrucks
+            print("[TruckService] ✓ Fetched \(fetchedTrucks.count) truck(s) for district \(districtId)")
             
-            print("[TruckService] ✓ Fetched \(fetchedTrucks.count) active truck(s)")
-            
-            // Validate that the current selection still exists and is active
+            // Validate current selection still exists
             if let currentId = selectedTruckId {
                 if !fetchedTrucks.contains(where: { $0.id == currentId }) {
-                    print("[TruckService] ⚠️ Previously selected truck no longer active — clearing selection")
+                    print("[TruckService] ⚠️ Selected truck no longer active — clearing")
                     clearSelection()
                 }
             }
@@ -147,17 +161,15 @@ class TruckService: ObservableObject {
     
     // MARK: - Select Truck
     
-    /// Tech picks a truck. Persists immediately to UserDefaults.
     func selectTruck(_ truck: Truck) {
         selectedTruckId = truck.id
         selectedTruckName = truck.name
         selectedTruckNumber = truck.truckNumber
-        print("[TruckService] ✓ Selected: \(truck.name) (id: \(truck.id))")
+        print("[TruckService] ✓ Selected: \(truck.name) (#\(truck.truckNumber))")
     }
     
     // MARK: - Clear Selection
     
-    /// Clears the current truck selection. Used if selected truck is deactivated.
     func clearSelection() {
         selectedTruckId = nil
         selectedTruckName = nil
