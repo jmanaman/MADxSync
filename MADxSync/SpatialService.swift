@@ -4,6 +4,8 @@
 //
 //  Fetches spatial data from Supabase with local caching
 //
+//  HARDENED: 2026-02-09 — Network guard on loadAllLayers, skips when offline.
+//
 
 import Foundation
 import Combine
@@ -53,6 +55,13 @@ class SpatialService: ObservableObject {
     // MARK: - Load All Layers
     
     func loadAllLayers() async {
+        // Network guard — don't fire doomed requests when offline.
+        // Cached data is already loaded in init(), so the map still has features.
+        guard NetworkMonitor.shared.hasInternet else {
+            print("[SpatialService] Load skipped — no internet, using cached data (\(totalFeatures) features)")
+            return
+        }
+        
         isLoading = true
         lastError = nil
         

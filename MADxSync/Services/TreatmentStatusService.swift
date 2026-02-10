@@ -9,6 +9,8 @@
 //  days-since calculations) and writes results to the treatment_status table.
 //  This service just reads that table and mirrors what the Hub shows.
 //
+//  HARDENED: 2026-02-09 — Network guard on syncFromHub, skips when offline.
+//
 
 import Foundation
 import Combine
@@ -197,8 +199,16 @@ class TreatmentStatusService: ObservableObject {
     
     // MARK: - Sync from Supabase
     
-    /// Pull treatment_status table from Supabase
+    /// Pull treatment_status table from Supabase.
+    /// HARDENED: Skips network request when offline — uses cached data instead.
     func syncFromHub() async {
+        // Network guard — don't fire a doomed request when offline
+        guard NetworkMonitor.shared.hasInternet else {
+            print("[TreatmentStatus] Sync skipped — no internet, using cached data (\(statusByFeature.count) statuses)")
+            isLoading = false
+            return
+        }
+        
         isLoading = true
         lastError = nil
         
@@ -231,6 +241,19 @@ class TreatmentStatusService: ObservableObject {
                 // Table doesn't exist yet - that's OK, Hub hasn't been updated yet
                 print("[HubTreatmentStatus] treatment_status table not found - Hub hasn't published yet")
                 lastSync = Date()
+                isLoading = false
+                return
+            }
+            
+            // Handle 401 — attempt token refresh
+            if httpResponse.statusCode == 401 {
+                let refreshed = await AuthService.shared.handleUnauthorized()
+                if refreshed {
+                    isLoading = false
+                    await syncFromHub()  // Retry with fresh token
+                    return
+                }
+                lastError = "Authentication failed"
                 isLoading = false
                 return
             }
@@ -275,6 +298,12 @@ class TreatmentStatusService: ObservableObject {
     
     /// Push pending local treatments to viewer_logs so Hub can process them
     func pushLocalTreatments() async {
+        // Network guard
+        guard NetworkMonitor.shared.hasInternet else {
+            print("[TreatmentStatus] Push skipped — no internet")
+            return
+        }
+        
         let pending = localOverrides.values.filter { !$0.syncedToHub }
         guard !pending.isEmpty else { return }
         

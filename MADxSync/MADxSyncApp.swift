@@ -14,6 +14,7 @@
 //
 
 import SwiftUI
+import UIKit
 
 @main
 struct MADxSyncApp: App {
@@ -21,6 +22,18 @@ struct MADxSyncApp: App {
     @StateObject private var truckService = TruckService.shared
     @StateObject private var networkMonitor = NetworkMonitor.shared
     @Environment(\.scenePhase) private var scenePhase
+    
+    /// Memory pressure observer — logs warnings to diagnose potential black screen issues
+    private let memoryObserver: Any? = NotificationCenter.default.addObserver(
+        forName: UIApplication.didReceiveMemoryWarningNotification,
+        object: nil,
+        queue: .main
+    ) { _ in
+        let usage = ProcessInfo.processInfo.physicalMemory > 0
+            ? String(format: "%.0f MB used", Double(getMemoryUsage()) / 1_048_576.0)
+            : "unknown"
+        print("[Memory] ⚠️ Memory warning received — \(usage)")
+    }
     
     var body: some Scene {
         WindowGroup {
@@ -154,4 +167,19 @@ struct RootView: View {
         .frame(maxWidth: .infinity)
         .background(Color.orange.opacity(0.9))
     }
+}
+
+// MARK: - Memory Usage Helper
+
+/// Returns the app's current memory footprint in bytes.
+/// Uses task_info to get the actual resident memory size.
+private func getMemoryUsage() -> UInt64 {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size) / 4
+    let result = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    return result == KERN_SUCCESS ? UInt64(info.phys_footprint) : 0
 }
