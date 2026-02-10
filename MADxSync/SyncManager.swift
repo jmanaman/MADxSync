@@ -404,6 +404,7 @@ class SyncManager: ObservableObject {
         let rowsWithTruck = rows.map { row -> [String: Any] in
             var newRow = row
             newRow["truck_id"] = truckId
+            newRow["district_id"] = AuthService.shared.districtId ?? ""
             return newRow
         }
         
@@ -412,6 +413,9 @@ class SyncManager: ObservableObject {
         request.httpMethod = "POST"
         request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = AuthService.shared.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         request.setValue("resolution=ignore-duplicates,return=minimal", forHTTPHeaderField: "Prefer")
         
         let jsonData = try JSONSerialization.data(withJSONObject: rowsWithTruck)

@@ -26,7 +26,9 @@ class SpatialService: ObservableObject {
     // MARK: - Configuration
     private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
     private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
-    private let districtId = "tulare_mad"
+    private var districtId: String {
+        AuthService.shared.districtId ?? ""
+    }
     
     // MARK: - Cache Keys
     private let cacheKeyBoundaries = "spatial_boundaries"
@@ -131,6 +133,10 @@ class SpatialService: ObservableObject {
         request.timeoutInterval = 30
         request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if let token = AuthService.shared.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         
         do {
             let (data, response) = try await URLSession.shared.data(for: request)

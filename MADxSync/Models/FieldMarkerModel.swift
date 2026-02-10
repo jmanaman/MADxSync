@@ -295,6 +295,7 @@ struct FieldMarker: Identifiable, Codable {
     func toSupabasePayload(deviceId: String, truckId: String? = nil) -> [String: Any] {
         var payload: [String: Any] = [
             "device_id": deviceId,
+            "district_id": AuthService.shared.districtId ?? "",
             "timestamp_iso": timestampISO,
             "lat": lat,
             "lon": lon,
@@ -327,7 +328,7 @@ struct FieldMarker: Identifiable, Codable {
     /// Generate payload for Supabase source_notes table (field notes)
     func toSourceNotePayload(truckId: String? = nil) -> [String: Any] {
         var payload: [String: Any] = [
-            "district_id": "2f05ab6e-dacb-4af5-b5d2-0156aa8b58ce",
+            "district_id": AuthService.shared.districtId ?? "",
             "note": noteText ?? "",
             "lat": lat,
             "lon": lon,
@@ -375,10 +376,22 @@ struct FieldMarker: Identifiable, Codable {
 }
 
 // MARK: - Marker Store
-/// In-memory store for markers with local persistence and Supabase sync
+/// Persistent store for field markers with network-aware store-and-forward sync.
+///
+/// STORE-AND-FORWARD ARCHITECTURE:
+/// 1. Every addMarker() call persists to disk IMMEDIATELY (atomic write)
+/// 2. If online → attempt Supabase sync right away
+/// 3. If offline → markers queue on disk, auto-drain when connectivity returns
+/// 4. App crash, iOS kill, battery death → markers survive on disk
+/// 5. Unsynced markers are NEVER deleted by cleanup routines
+///
+/// HARDENED: 2026-02-09 — Network-aware sync, auto-retry on reconnect,
+/// 401 token refresh handling, exponential backoff, atomic file writes.
+
 extension Notification.Name {
-   static let markerAdded = Notification.Name("markerAdded")
+    static let markerAdded = Notification.Name("markerAdded")
 }
+
 @MainActor
 class MarkerStore: ObservableObject {
     static let shared = MarkerStore()
@@ -404,6 +417,17 @@ class MarkerStore: ObservableObject {
     
     private let fileURL: URL
     
+    /// Network reconnect observer
+    private var networkObserver: Any?
+    
+    /// Backoff tracking for sync failures
+    private var consecutiveSyncFailures: Int = 0
+    private var isSyncBackingOff: Bool = false
+    private let maxBackoffSeconds: Double = 300  // 5 minutes max
+    
+    /// Prevents overlapping sync cycles
+    private var syncTask: Task<Void, Never>?
+    
     private init() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         fileURL = docs.appendingPathComponent("pending_markers.json")
@@ -414,22 +438,76 @@ class MarkerStore: ObservableObject {
         
         // Schedule midnight cleanup
         scheduleMidnightCleanup()
+        
+        // Listen for network restoration to auto-drain sync queue
+        setupNetworkObserver()
+        
+        // If we have unsynced markers and internet is available, sync now
+        if pendingSyncCount > 0 && NetworkMonitor.shared.hasInternet {
+            print("[MarkerStore] Found \(pendingSyncCount) unsynced markers on launch — syncing")
+            syncTask = Task { await syncToSupabase() }
+        }
+    }
+    
+    deinit {
+        if let observer = networkObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        syncTask?.cancel()
+    }
+    
+    // MARK: - Network Observer
+    
+    /// Listen for network state changes to auto-sync when connectivity returns
+    private func setupNetworkObserver() {
+        networkObserver = NotificationCenter.default.addObserver(
+            forName: .networkStateChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let network = NetworkMonitor.shared
+                
+                // Only trigger sync when internet comes back AND we have unsynced markers
+                if network.hasInternet && self.pendingSyncCount > 0 && !self.isSyncing {
+                    print("[MarkerStore] Network restored — syncing \(self.pendingSyncCount) queued markers")
+                    self.consecutiveSyncFailures = 0  // Reset backoff on fresh connectivity
+                    self.isSyncBackingOff = false
+                    self.syncTask?.cancel()
+                    self.syncTask = Task { await self.syncToSupabase() }
+                }
+            }
+        }
     }
     
     // MARK: - Add Marker
+    
+    /// Add a marker. Persists to disk IMMEDIATELY, then attempts sync.
+    /// This is the critical path — disk write happens before sync attempt
+    /// so the marker survives even if the app crashes during sync.
     func addMarker(_ marker: FieldMarker) {
         markers.append(marker)
         updatePendingCount()
+        
+        // CRITICAL: Persist to disk FIRST, before any network activity.
+        // If the app crashes after this line, the marker is safe on disk.
         saveMarkers()
+        
+        // Notify map to add annotation
         NotificationCenter.default.post(name: .markerAdded, object: marker)
         
-        // Auto-sync to Supabase
-        Task {
-            await syncToSupabase()
+        // Attempt sync if online (non-blocking — marker is already saved)
+        if NetworkMonitor.shared.hasInternet && !isSyncBackingOff {
+            syncTask?.cancel()
+            syncTask = Task { await syncToSupabase() }
+        } else if !NetworkMonitor.shared.hasInternet {
+            print("[MarkerStore] Offline — marker saved to disk, \(pendingSyncCount) queued for sync")
         }
     }
     
     // MARK: - Mark Synced
+    
     func markSyncedToFLO(_ marker: FieldMarker) {
         if let index = markers.firstIndex(where: { $0.id == marker.id }) {
             markers[index].syncedToFLO = true
@@ -445,31 +523,125 @@ class MarkerStore: ObservableObject {
         }
     }
     
-    // MARK: - Sync to Supabase
+    // MARK: - Sync to Supabase (Network-Aware with Backoff)
+    
+    /// Sync all unsynced markers to Supabase.
+    /// Network-aware: skips if offline. Backs off on repeated failures.
+    /// Handles 401 with token refresh and single retry.
     func syncToSupabase() async {
-        let unsyncedMarkers = markers.filter { !$0.syncedToSupabase }
+        // Guard: don't sync if offline
+        guard NetworkMonitor.shared.hasInternet else {
+            print("[MarkerStore] Sync skipped — no internet (\(pendingSyncCount) markers queued)")
+            return
+        }
         
+        // Guard: don't overlap sync cycles
+        guard !isSyncing else {
+            return
+        }
+        
+        // Guard: respect backoff
+        guard !isSyncBackingOff else {
+            return
+        }
+        
+        let unsyncedMarkers = markers.filter { !$0.syncedToSupabase }
         guard !unsyncedMarkers.isEmpty else { return }
         
         isSyncing = true
         lastSyncError = nil
         
+        var successCount = 0
+        var failCount = 0
+        
         for marker in unsyncedMarkers {
+            // Check connectivity before each upload — network could drop mid-batch
+            guard NetworkMonitor.shared.hasInternet else {
+                print("[MarkerStore] Network lost during sync — pausing (\(successCount) synced, \(unsyncedMarkers.count - successCount) remaining)")
+                break
+            }
+            
+            // Check for task cancellation (new sync cycle started)
+            guard !Task.isCancelled else { break }
+            
             do {
-                try await uploadMarker(marker)
+                try await uploadMarkerWithRetry(marker)
                 markSyncedToSupabase(marker.id)
-                print("[MarkerStore] ✓ Synced \(marker.markerType.lowercased()) \(marker.id)")
+                successCount += 1
+                print("[MarkerStore] ✓ Synced \(marker.markerType.lowercased()) \(marker.id.uuidString.prefix(8))")
             } catch {
-                print("[MarkerStore] ✗ Failed to sync marker: \(error)")
+                failCount += 1
+                print("[MarkerStore] ✗ Failed to sync marker \(marker.id.uuidString.prefix(8)): \(error)")
                 lastSyncError = error.localizedDescription
+                
+                // Don't keep trying if we're getting errors — back off
+                // The marker is safe on disk and will sync later
+                break
             }
         }
         
         isSyncing = false
         updatePendingCount()
+        
+        if successCount > 0 {
+            print("[MarkerStore] Sync batch complete: \(successCount) synced, \(pendingSyncCount) remaining")
+        }
+        
+        // Handle failures with backoff
+        if failCount > 0 {
+            consecutiveSyncFailures += 1
+            scheduleRetrySync()
+        } else {
+            consecutiveSyncFailures = 0
+        }
+    }
+    
+    // MARK: - Upload with 401 Retry
+    
+    /// Upload a single marker, handling 401 with token refresh and one retry.
+    private func uploadMarkerWithRetry(_ marker: FieldMarker) async throws {
+        do {
+            try await uploadMarker(marker)
+        } catch MarkerSyncError.uploadFailed(statusCode: 401) {
+            // Token expired — refresh and retry once
+            print("[MarkerStore] Got 401 — refreshing token and retrying")
+            let refreshed = await AuthService.shared.handleUnauthorized()
+            if refreshed {
+                try await uploadMarker(marker)
+            } else {
+                throw MarkerSyncError.uploadFailed(statusCode: 401)
+            }
+        }
+    }
+    
+    // MARK: - Backoff Retry
+    
+    /// Schedule a retry with exponential backoff: 5s, 10s, 20s, 40s, ... up to 5 min
+    private func scheduleRetrySync() {
+        let backoffSeconds = min(5.0 * pow(2.0, Double(consecutiveSyncFailures - 1)), maxBackoffSeconds)
+        isSyncBackingOff = true
+        
+        print("[MarkerStore] Sync failed — retrying in \(Int(backoffSeconds))s (attempt \(consecutiveSyncFailures))")
+        
+        Task {
+            try? await Task.sleep(nanoseconds: UInt64(backoffSeconds * 1_000_000_000))
+            
+            guard !Task.isCancelled else { return }
+            
+            await MainActor.run {
+                isSyncBackingOff = false
+                
+                // Only retry if still have unsynced markers and internet
+                if pendingSyncCount > 0 && NetworkMonitor.shared.hasInternet {
+                    syncTask?.cancel()
+                    syncTask = Task { await syncToSupabase() }
+                }
+            }
+        }
     }
     
     // MARK: - Upload Single Marker
+    
     private func uploadMarker(_ marker: FieldMarker) async throws {
         // Route notes to source_notes, everything else to app_markers
         if marker.isNote {
@@ -493,6 +665,9 @@ class MarkerStore: ObservableObject {
         request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("return=minimal", forHTTPHeaderField: "Prefer")
+        if let token = AuthService.shared.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         
         let jsonData = try JSONSerialization.data(withJSONObject: payload)
         request.httpBody = jsonData
@@ -517,19 +692,15 @@ class MarkerStore: ObservableObject {
         
         let payload = marker.toSourceNotePayload(truckId: TruckService.shared.selectedTruckId)
         
-        // Log what we're sending
-        if let jsonDebug = try? JSONSerialization.data(withJSONObject: payload, options: .prettyPrinted),
-           let jsonString = String(data: jsonDebug, encoding: .utf8) {
-            print("[MarkerStore] 📝 Uploading note to source_notes:")
-            print(jsonString)
-        }
-        
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 15
         request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("return=minimal", forHTTPHeaderField: "Prefer")
+        if let token = AuthService.shared.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         
         let jsonData = try JSONSerialization.data(withJSONObject: payload)
         request.httpBody = jsonData
@@ -540,21 +711,17 @@ class MarkerStore: ObservableObject {
             throw MarkerSyncError.noResponse
         }
         
-        // Log response details for debugging
-        print("[MarkerStore] 📝 source_notes response: \(httpResponse.statusCode)")
-        if let responseBody = String(data: data, encoding: .utf8), !responseBody.isEmpty {
-            print("[MarkerStore] 📝 Response body: \(responseBody)")
-        }
-        
         guard (200...299).contains(httpResponse.statusCode) || httpResponse.statusCode == 409 else {
             let errorBody = String(data: data, encoding: .utf8) ?? "no body"
-            print("[MarkerStore] ✗ Note upload FAILED: \(httpResponse.statusCode) — \(errorBody)")
+            print("[MarkerStore] ✗ Note upload failed: \(httpResponse.statusCode) — \(errorBody)")
             throw MarkerSyncError.uploadFailed(statusCode: httpResponse.statusCode)
         }
     }
     
     // MARK: - Remove Synced Markers (manual - for overnight work)
+    
     /// Clears only markers that have been synced to Supabase. Safe to call anytime.
+    /// UNSYNCED MARKERS ARE NEVER DELETED.
     func clearSyncedMarkers() {
         let beforeCount = markers.count
         markers.removeAll { $0.syncedToSupabase }
@@ -565,14 +732,17 @@ class MarkerStore: ObservableObject {
     }
     
     // MARK: - Midnight Auto-Clear
-    /// Called on app launch and periodically - clears synced markers from previous days
+    
+    /// Called on app launch and at midnight — clears synced markers from previous days.
+    /// CRITICAL: Only removes markers where syncedToSupabase == true AND timestamp is before today.
+    /// Unsynced markers are NEVER touched, regardless of age.
     func clearSyncedFromPreviousDays() {
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
         
         let beforeCount = markers.count
         markers.removeAll { marker in
-            // Only remove if synced AND from a previous day
+            // SAFETY: Only remove if synced AND from a previous day
             guard marker.syncedToSupabase else { return false }
             let markerDay = calendar.startOfDay(for: marker.timestamp)
             return markerDay < today
@@ -609,6 +779,7 @@ class MarkerStore: ObservableObject {
     }
     
     // MARK: - Undo Last
+    
     func undoLast() {
         guard !markers.isEmpty else { return }
         markers.removeLast()
@@ -617,6 +788,7 @@ class MarkerStore: ObservableObject {
     }
     
     // MARK: - Stats for UI
+    
     var syncedCount: Int {
         markers.filter { $0.syncedToSupabase }.count
     }
@@ -631,32 +803,53 @@ class MarkerStore: ObservableObject {
         return markers.filter { calendar.startOfDay(for: $0.timestamp) == today }.count
     }
     
-    // MARK: - Persistence
+    // MARK: - Persistence (Atomic Writes)
+    
     private func updatePendingCount() {
         pendingSyncCount = markers.filter { !$0.syncedToSupabase }.count
     }
     
+    /// Save markers to disk with atomic write.
+    /// Atomic = write to temp file first, then rename. If the app crashes mid-write,
+    /// the previous valid file remains intact. No data loss.
     private func saveMarkers() {
         do {
             let data = try JSONEncoder().encode(markers)
-            try data.write(to: fileURL)
+            try data.write(to: fileURL, options: .atomic)
         } catch {
-            print("[MarkerStore] Failed to save markers: \(error)")
+            print("[MarkerStore] ⚠️ Failed to save markers: \(error)")
         }
     }
     
+    /// Load markers from disk on app launch.
+    /// If the file is corrupted or missing, start with empty array.
+    /// Markers are never lost unless the file system itself fails.
     private func loadMarkers() {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            markers = []
+            print("[MarkerStore] No marker file found — starting fresh")
+            return
+        }
+        
         do {
             let data = try Data(contentsOf: fileURL)
             markers = try JSONDecoder().decode([FieldMarker].self, from: data)
             updatePendingCount()
+            print("[MarkerStore] Loaded \(markers.count) markers from disk (\(pendingSyncCount) unsynced)")
         } catch {
+            // File exists but is corrupted — DON'T delete it.
+            // Move it aside for debugging and start fresh.
+            let backupURL = fileURL.deletingLastPathComponent()
+                .appendingPathComponent("pending_markers_corrupt_\(Int(Date().timeIntervalSince1970)).json")
+            try? FileManager.default.moveItem(at: fileURL, to: backupURL)
             markers = []
+            print("[MarkerStore] ⚠️ Marker file corrupted — moved to backup, starting fresh. Error: \(error)")
         }
     }
 }
 
 // MARK: - Sync Errors
+
 enum MarkerSyncError: Error {
     case invalidURL
     case noResponse

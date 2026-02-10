@@ -7,6 +7,10 @@
 //
 //  North-up map, rotating arrow shows heading direction.
 //
+//  PERFORMANCE FIX: distanceFilter = kCLDistanceFilterNone for continuous updates.
+//  Arrow rendering moved to HeadingArrowView (GPU-composited UIView) so frequent
+//  GPS updates no longer choke the main thread with overlay add/remove cycles.
+//
 
 import Foundation
 import MapKit
@@ -41,6 +45,12 @@ class NavigationService: NSObject, ObservableObject {
     /// Authorization status
     @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
     
+    // MARK: - Direct callbacks (bypass SwiftUI for performance-critical updates)
+    
+    /// Called on every GPS update — Coordinator subscribes to this directly.
+    /// This avoids the SwiftUI @Published → updateUIView → full coordinator pipeline.
+    var onLocationUpdate: ((CLLocation, CLLocationDirection) -> Void)?
+    
     // MARK: - Location Manager
     
     private let locationManager = CLLocationManager()
@@ -52,7 +62,7 @@ class NavigationService: NSObject, ObservableObject {
     private let minimumSpeedForCourseHeading: Double = 3.0
     
     /// Follow mode zoom span (latitude degrees)
-    /// ~0.01 = roughly street level, good for field work
+    /// ~0.015 = roughly street level, good for field work
     let followZoomSpan: CLLocationDegrees = 0.015
     
     // MARK: - Init
@@ -61,8 +71,9 @@ class NavigationService: NSObject, ObservableObject {
         super.init()
         locationManager.delegate = self
         locationManager.desiredAccuracy = kCLLocationAccuracyBest
-        locationManager.distanceFilter = 2  // Update every 2 meters of movement
-        locationManager.headingFilter = 2   // Update every 2 degrees of heading change
+        // Continuous updates — arrow view handles rendering efficiently
+        locationManager.distanceFilter = kCLDistanceFilterNone
+        locationManager.headingFilter = 1   // Update every 1 degree of heading change
     }
     
     // MARK: - Public Methods
@@ -70,19 +81,15 @@ class NavigationService: NSObject, ObservableObject {
     /// Request location permission and start updates
     func requestPermission() {
         let status = locationManager.authorizationStatus
-        print("[NAV] requestPermission - current status: \(status.rawValue)")
         if status == .authorizedWhenInUse || status == .authorizedAlways {
-            print("[NAV] Already authorized, calling startUpdating")
             startUpdating()
         } else {
-            print("[NAV] Requesting authorization")
             locationManager.requestWhenInUseAuthorization()
         }
     }
     
     /// Start receiving location and heading updates
     func startUpdating() {
-        print("[NAV] startUpdating called - authStatus: \(locationManager.authorizationStatus.rawValue)")
         locationManager.startUpdatingLocation()
         locationManager.startUpdatingHeading()
     }
@@ -95,7 +102,6 @@ class NavigationService: NSObject, ObservableObject {
     
     /// Toggle follow mode
     func toggleFollow() {
-        print("[NAV] toggleFollow - isFollowing will be: \(!isFollowing), hasLocation: \(hasLocation), location: \(String(describing: location))")
         isFollowing.toggle()
     }
     
@@ -103,7 +109,6 @@ class NavigationService: NSObject, ObservableObject {
     var coordinate: CLLocationCoordinate2D? {
         location?.coordinate
     }
-    
 }
 
 // MARK: - CLLocationManagerDelegate
@@ -111,17 +116,13 @@ class NavigationService: NSObject, ObservableObject {
 extension NavigationService: CLLocationManagerDelegate {
     
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        print("[NAV] didUpdateLocations - got \(locations.count) locations")
         guard let newLocation = locations.last else { return }
         
         // Filter out invalid or very old locations
         let age = -newLocation.timestamp.timeIntervalSinceNow
-        guard age < 10, newLocation.horizontalAccuracy >= 0 else {
-            print("[NAV] Location filtered out - age: \(age), accuracy: \(newLocation.horizontalAccuracy)")
-            return
-        }
+        guard age < 10, newLocation.horizontalAccuracy >= 0 else { return }
         
-        print("[NAV] Valid location: \(newLocation.coordinate.latitude), \(newLocation.coordinate.longitude)")
+        // Update published state (drives SwiftUI bottom bar, route service, etc.)
         location = newLocation
         hasLocation = true
         
@@ -139,6 +140,10 @@ extension NavigationService: CLLocationManagerDelegate {
             heading = newLocation.course
             hasHeading = true
         }
+        
+        // Fire direct callback to Coordinator — this is the fast path
+        // that moves the arrow without going through SwiftUI's update cycle
+        onLocationUpdate?(newLocation, heading)
     }
     
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
@@ -154,11 +159,15 @@ extension NavigationService: CLLocationManagerDelegate {
         if compassHeading >= 0 {
             heading = compassHeading
             hasHeading = true
+            
+            // Fire direct callback for heading-only updates too
+            if let loc = location {
+                onLocationUpdate?(loc, heading)
+            }
         }
     }
     
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        print("[NAV] authorizationDidChange: \(manager.authorizationStatus.rawValue)")
         authorizationStatus = manager.authorizationStatus
         
         switch authorizationStatus {
@@ -171,118 +180,5 @@ extension NavigationService: CLLocationManagerDelegate {
     
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         print("[NAV] Location error: \(error.localizedDescription)")
-    }
-}
-
-// MARK: - Heading Arrow Overlay
-
-/// Custom MKOverlay that represents the truck's position and heading.
-/// Drawn as a blue chevron/arrow pointing in the direction of travel.
-class HeadingArrowOverlay: NSObject, MKOverlay {
-    
-    var coordinateValue: CLLocationCoordinate2D
-    var headingDegrees: CLLocationDirection
-    var accuracy: CLLocationAccuracy
-    
-    var coordinate: CLLocationCoordinate2D { coordinateValue }
-    
-    /// Bounding rect needs to be large enough that the arrow doesn't get culled
-    var boundingMapRect: MKMapRect {
-        let point = MKMapPoint(coordinateValue)
-        // 500m radius should be plenty for the arrow size at any zoom
-        let size: Double = 1000
-        return MKMapRect(x: point.x - size / 2, y: point.y - size / 2, width: size, height: size)
-    }
-    
-    init(coordinate: CLLocationCoordinate2D, heading: CLLocationDirection, accuracy: CLLocationAccuracy = 10) {
-        self.coordinateValue = coordinate
-        self.headingDegrees = heading
-        self.accuracy = accuracy
-        super.init()
-    }
-}
-
-// MARK: - Heading Arrow Renderer
-
-/// Renders a blue chevron arrow on the map that rotates with heading.
-/// North-up map — only the arrow rotates, not the map.
-class HeadingArrowRenderer: MKOverlayRenderer {
-    
-    /// Arrow fill color
-    private let arrowColor = UIColor.systemBlue
-    
-    /// Arrow outline
-    private let outlineColor = UIColor.white
-    
-    /// Accuracy circle color
-    private let accuracyColor = UIColor.systemBlue.withAlphaComponent(0.1)
-    
-    override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
-        guard let arrow = overlay as? HeadingArrowOverlay else { return }
-        
-        let center = point(for: MKMapPoint(arrow.coordinateValue))
-        
-        // Arrow size in screen points (constant regardless of zoom)
-        let arrowLength: CGFloat = 28 / zoomScale
-        let arrowWidth: CGFloat = 18 / zoomScale
-        
-        // Convert heading to radians (clockwise from north)
-        // Core Graphics rotates counterclockwise, and 0° = east in CG vs north in compass
-        let headingRadians = CGFloat(arrow.headingDegrees) * .pi / 180
-        
-        context.saveGState()
-        
-        // Draw accuracy circle (subtle blue halo)
-        let accuracyRadius = CGFloat(arrow.accuracy) / CGFloat(zoomScale) * 0.5
-        if accuracyRadius > arrowLength {
-            context.setFillColor(accuracyColor.cgColor)
-            context.fillEllipse(in: CGRect(
-                x: center.x - accuracyRadius,
-                y: center.y - accuracyRadius,
-                width: accuracyRadius * 2,
-                height: accuracyRadius * 2
-            ))
-        }
-        
-        // Move to center point and rotate
-        context.translateBy(x: center.x, y: center.y)
-        context.rotate(by: headingRadians)
-        
-        // Draw chevron arrow pointing UP (north = 0 rotation)
-        // The arrow points in the -Y direction (up on screen before rotation)
-        let path = CGMutablePath()
-        
-        // Tip of arrow (forward)
-        path.move(to: CGPoint(x: 0, y: -arrowLength))
-        
-        // Right wing
-        path.addLine(to: CGPoint(x: arrowWidth / 2, y: arrowLength * 0.3))
-        
-        // Inner notch (makes it a chevron, not a triangle)
-        path.addLine(to: CGPoint(x: 0, y: arrowLength * 0.05))
-        
-        // Left wing
-        path.addLine(to: CGPoint(x: -arrowWidth / 2, y: arrowLength * 0.3))
-        
-        // Close back to tip
-        path.closeSubpath()
-        
-        // White outline first (2px border)
-        context.setStrokeColor(outlineColor.cgColor)
-        context.setLineWidth(3 / zoomScale)
-        context.addPath(path)
-        context.strokePath()
-        
-        // Blue fill
-        context.setFillColor(arrowColor.cgColor)
-        context.addPath(path)
-        context.fillPath()
-        
-        // Small white dot at center (position indicator)
-        let dotSize: CGFloat = 4 / zoomScale
-        context.setFillColor(outlineColor.cgColor)
-        context.fillEllipse(in: CGRect(x: -dotSize / 2, y: -dotSize / 2, width: dotSize, height: dotSize))
-        
-        context.restoreGState()
     }
 }

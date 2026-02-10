@@ -8,6 +8,8 @@
 //  UPDATED: NavigationService replaces LocationManager - adds heading arrow + follow mode
 //  UPDATED: Note tool added — field notes sync to source_notes table
 //  UPDATED: Snap to point sites and storm drains
+//  UPDATED: HeadingArrowView replaces HeadingArrowOverlay for smooth GPU-composited navigation
+//  UPDATED: Dirty flags decouple spatial layer updates from GPS tick updates
 //
 
 import SwiftUI
@@ -40,52 +42,30 @@ struct FieldMapView: View {
         span: MKCoordinateSpan(latitudeDelta: 0.1, longitudeDelta: 0.1)
     )
     
-    // Tool state
     @State private var activeTool: ActiveTool = .none
-    
-    // Treatment context (persists while tool is active)
     @State private var treatmentFamily: TreatmentFamily = .field
     @State private var treatmentStatus: TreatmentStatus = .treated
     @State private var selectedChemical: String = "BTI Sand"
     @State private var doseValue: Double = 4.0
     @State private var doseUnit: DoseUnit = .oz
-    
-    // Larvae quick picker
     @State private var showLarvaePicker = false
     @State private var pendingLarvaeCoordinate: CLLocationCoordinate2D?
-    
-    // Note quick picker
     @State private var showNotePicker = false
     @State private var pendingNoteCoordinate: CLLocationCoordinate2D?
     @State private var noteInputText: String = ""
-    
-    // Layer sheet
     @State private var showLayerSheet = false
-    
-    // Feature identification
     @State private var selectedFeature: SelectedFeature?
     @State private var showFeatureInfo = false
-    
-    // Track which features were turned green by treatment drops (for undo)
     @State private var treatedFeatureStack: [String] = []
-    
-    // Larvae picker state
     @State private var selectedLarvaeLevel: LarvaeLevel = .few
     @State private var pupaeSelected: Bool = false
-    
-    // Snap feedback
     @State private var showSnapToast = false
     @State private var snapSourceName: String = ""
-    
-    // Force map refresh counter
     @State private var mapRefreshTrigger: Int = 0
-    
-    // Navigation route
     @State private var showRoutePolyline: Bool = false
     
     var body: some View {
         ZStack {
-            // Map with spatial layers
             SpatialMapView(
                 region: $mapRegion,
                 markers: markerStore.markers,
@@ -108,9 +88,7 @@ struct FieldMapView: View {
             )
             .edgesIgnoringSafeArea(.all)
             
-            // UI Overlay
             VStack(spacing: 0) {
-                // Top bar: FLO Control + Layer button
                 HStack(alignment: .top) {
                     FLOControlView()
                     Spacer()
@@ -122,13 +100,11 @@ struct FieldMapView: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
                 
-                // Navigation banner (when navigating to a source)
                 NavigationBannerView(routeService: routeService) {
                     routeService.cancelNavigation()
                     activeTool = .none
                 }
                 
-                // Context strip (when treatment tool active)
                 if activeTool == .treatment {
                     treatmentContextStrip
                         .padding(.horizontal, 12)
@@ -137,12 +113,9 @@ struct FieldMapView: View {
                 }
                 
                 Spacer()
-                
-                // Bottom bar with GPS + nav + active tool indicator
                 bottomBar
             }
             
-            // Tool FABs (right side)
             VStack {
                 Spacer()
                 HStack {
@@ -153,19 +126,16 @@ struct FieldMapView: View {
             .padding(.bottom, 60)
             .padding(.trailing, 16)
             
-            // Larvae quick picker modal
             if showLarvaePicker {
                 larvaeQuickPicker
                     .transition(.opacity)
             }
             
-            // Note quick picker modal
             if showNotePicker {
                 noteQuickPicker
                     .transition(.opacity)
             }
             
-            // Snap toast feedback
             SnapToastView(sourceName: snapSourceName, isVisible: showSnapToast)
                 .allowsHitTesting(false)
         }
@@ -200,40 +170,34 @@ struct FieldMapView: View {
             if arrived {
                 let impact = UIImpactFeedbackGenerator(style: .heavy)
                 impact.impactOccurred()
-                impact.impactOccurred()  // Double tap for emphasis
+                impact.impactOccurred()
             }
         }
     }
     
     // MARK: - Handle Map Tap
     private func handleMapTap(_ coordinate: CLLocationCoordinate2D, screenPoint: CGPoint) {
-        // Check for snap to point sites or storm drains
         let snapResult = SnapService.checkSnap(
             coordinate: coordinate,
             pointSites: spatialService.pointSites,
             stormDrains: spatialService.stormDrains
         )
         
-        // Use snapped coordinate if available, otherwise original
         let finalCoordinate = snapResult?.coordinate ?? coordinate
         
-        // Show toast if snapped (only for treatment tool)
         if let snap = snapResult, activeTool == .treatment {
             snapSourceName = snap.sourceName
             withAnimation(.easeOut(duration: 0.2)) {
                 showSnapToast = true
             }
-            
             let impact = UIImpactFeedbackGenerator(style: .rigid)
             impact.impactOccurred()
-            
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 withAnimation(.easeIn(duration: 0.2)) {
                     showSnapToast = false
                 }
             }
         } else if snapResult != nil {
-            // Just haptic for larvae/note snap
             let impact = UIImpactFeedbackGenerator(style: .rigid)
             impact.impactOccurred()
         }
@@ -251,7 +215,6 @@ struct FieldMapView: View {
             noteInputText = ""
             showNotePicker = true
         case .navigate:
-            // Hit test to find what source was tapped
             let feature = SpatialHitTester.hitTest(
                 coordinate: finalCoordinate,
                 fields: spatialService.fields,
@@ -260,16 +223,13 @@ struct FieldMapView: View {
                 stormDrains: spatialService.stormDrains,
                 mapView: nil
             )
-            
             if let feature = feature {
-                Task {
-                    await startNavigation(to: feature)
-                }
+                Task { await startNavigation(to: feature) }
             }
         }
     }
     
-    // MARK: - Drop Treatment Marker (instant)
+    // MARK: - Drop Treatment Marker
     private func dropTreatmentMarker(at coordinate: CLLocationCoordinate2D, snappedTo: SnapResult? = nil) {
         let marker = FieldMarker(
             lat: coordinate.latitude,
@@ -283,17 +243,14 @@ struct FieldMapView: View {
         
         markerStore.addMarker(marker)
         
-        // Both TREATED and OBSERVED reset the treatment clock (turn green)
         if treatmentStatus == .treated || treatmentStatus == .observed {
             var featureId: String? = nil
             var featureType: String? = nil
             
-            // If we snapped to a point site or storm drain, use that directly
             if let snap = snappedTo {
                 featureId = snap.sourceId
                 featureType = snap.sourceType
             } else {
-                // Otherwise do hit test for polygons/polylines
                 let hitFeature = SpatialHitTester.hitTest(
                     coordinate: coordinate,
                     fields: spatialService.fields,
@@ -302,31 +259,18 @@ struct FieldMapView: View {
                     stormDrains: spatialService.stormDrains,
                     mapView: nil
                 )
-                
                 if let feature = hitFeature {
                     switch feature {
-                    case .field(let f):
-                        featureId = f.id
-                        featureType = "field"
-                    case .polyline(let p):
-                        featureId = p.id
-                        featureType = "polyline"
-                    case .pointSite(let s):
-                        featureId = s.id
-                        featureType = "pointsite"
-                    case .stormDrain(let d):
-                        featureId = d.id
-                        featureType = "stormdrain"
+                    case .field(let f): featureId = f.id; featureType = "field"
+                    case .polyline(let p): featureId = p.id; featureType = "polyline"
+                    case .pointSite(let s): featureId = s.id; featureType = "pointsite"
+                    case .stormDrain(let d): featureId = d.id; featureType = "stormdrain"
                     }
                 }
             }
             
             if let fId = featureId, let fType = featureType {
-                treatmentStatusService.markTreatedLocally(
-                    featureId: fId,
-                    featureType: fType,
-                    chemical: selectedChemical
-                )
+                treatmentStatusService.markTreatedLocally(featureId: fId, featureType: fType, chemical: selectedChemical)
                 treatedFeatureStack.append(fId)
             } else {
                 treatedFeatureStack.append("")
@@ -342,9 +286,7 @@ struct FieldMapView: View {
             Task {
                 let payload = marker.toFLOPayload()
                 let success = await floService.postViewerLog(payload: payload)
-                if success {
-                    markerStore.markSyncedToFLO(marker)
-                }
+                if success { markerStore.markSyncedToFLO(marker) }
             }
         }
     }
@@ -352,30 +294,18 @@ struct FieldMapView: View {
     // MARK: - Drop Larvae Marker
     private func dropLarvaeMarker(level: LarvaeLevel, pupae: Bool) {
         guard let coordinate = pendingLarvaeCoordinate else { return }
-        
-        let marker = FieldMarker(
-            lat: coordinate.latitude,
-            lon: coordinate.longitude,
-            larvae: level.rawValue,
-            pupaePresent: pupae
-        )
-        
+        let marker = FieldMarker(lat: coordinate.latitude, lon: coordinate.longitude, larvae: level.rawValue, pupaePresent: pupae)
         markerStore.addMarker(marker)
-        
         let impact = UIImpactFeedbackGenerator(style: .light)
         impact.impactOccurred()
-        
         if floService.isConnected {
             Task {
                 let payload = marker.toFLOPayload()
                 _ = await floService.postViewerLog(payload: payload)
             }
         }
-        
         showLarvaePicker = false
         pendingLarvaeCoordinate = nil
-        
-        // Force map to refresh
         mapRefreshTrigger += 1
     }
     
@@ -383,28 +313,14 @@ struct FieldMapView: View {
     private func dropNoteMarker() {
         guard let coordinate = pendingNoteCoordinate else { return }
         guard !noteInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        
-        let marker = FieldMarker(
-            lat: coordinate.latitude,
-            lon: coordinate.longitude,
-            noteText: noteInputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
-        
+        let marker = FieldMarker(lat: coordinate.latitude, lon: coordinate.longitude, noteText: noteInputText.trimmingCharacters(in: .whitespacesAndNewlines))
         markerStore.addMarker(marker)
-        
-        // Notes don't affect treatment status — no feature stack tracking needed
         treatedFeatureStack.append("")
-        
         let impact = UIImpactFeedbackGenerator(style: .light)
         impact.impactOccurred()
-        
-        // Notes don't push to FLO viewer_log — they go to source_notes only
-        
         showNotePicker = false
         pendingNoteCoordinate = nil
         noteInputText = ""
-        
-        // Force map to refresh
         mapRefreshTrigger += 1
     }
     
@@ -417,56 +333,25 @@ struct FieldMapView: View {
         
         switch feature {
         case .field(let f):
-            // Use centroid of field
-            if let centroid = f.centroid {
-                coordinate = centroid
-            } else {
-                return
-            }
-            name = f.displayName
-            type = "field"
-            id = f.id
-            
+            guard let centroid = f.centroid else { return }
+            coordinate = centroid; name = f.displayName; type = "field"; id = f.id
         case .polyline(let p):
-            // Use midpoint of polyline
-            if let midpoint = p.midpoint {
-                coordinate = midpoint
-            } else {
-                return
-            }
-            name = p.name ?? "Ditch/Canal"
-            type = "polyline"
-            id = p.id
-            
+            guard let midpoint = p.midpoint else { return }
+            coordinate = midpoint; name = p.name ?? "Ditch/Canal"; type = "polyline"; id = p.id
         case .pointSite(let s):
             guard let coord = s.coordinate else { return }
-            coordinate = coord
-            name = s.displayName
-            type = "pointsite"
-            id = s.id
-            
+            coordinate = coord; name = s.displayName; type = "pointsite"; id = s.id
         case .stormDrain(let d):
             guard let coord = d.coordinate else { return }
-            coordinate = coord
-            name = d.name ?? "Storm Drain"
-            type = "stormdrain"
-            id = d.id
+            coordinate = coord; name = d.name ?? "Storm Drain"; type = "stormdrain"; id = d.id
         }
         
-        // Haptic feedback
         let impact = UIImpactFeedbackGenerator(style: .medium)
         impact.impactOccurred()
-        
-        // Start navigation
-        await routeService.navigateTo(
-            coordinate: coordinate,
-            name: name,
-            type: type,
-            id: id
-        )
+        await routeService.navigateTo(coordinate: coordinate, name: name, type: type, id: id)
     }
     
-    // MARK: - Dose Presets by Unit
+    // MARK: - Dose Presets
     private var dosePresetsForUnit: [Double] {
         switch doseUnit {
         case .oz, .flOz: return [0.5, 1, 2, 4, 8]
@@ -493,9 +378,7 @@ struct FieldMapView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 280)
-                
                 Spacer()
-                
                 Button(action: {
                     treatmentStatus = treatmentStatus == .treated ? .observed : .treated
                 }) {
@@ -508,7 +391,6 @@ struct FieldMapView: View {
                         .cornerRadius(8)
                 }
             }
-            
             HStack(spacing: 10) {
                 Menu {
                     ForEach(ChemicalData.byCategory, id: \.category) { group in
@@ -523,51 +405,34 @@ struct FieldMapView: View {
                     }
                 } label: {
                     HStack(spacing: 4) {
-                        Text(selectedChemical)
-                            .font(.subheadline)
-                            .lineLimit(1)
-                            .frame(maxWidth: 140, alignment: .leading)
-                        Image(systemName: "chevron.down")
-                            .font(.caption2)
+                        Text(selectedChemical).font(.subheadline).lineLimit(1).frame(maxWidth: 140, alignment: .leading)
+                        Image(systemName: "chevron.down").font(.caption2)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(Color(.secondarySystemBackground))
-                    .cornerRadius(8)
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .background(Color(.secondarySystemBackground)).cornerRadius(8)
                 }
-                
                 Spacer()
-                
                 TextField("0", value: $doseValue, format: .number)
                     .keyboardType(.decimalPad)
                     .font(.system(.body, design: .monospaced))
-                    .frame(width: 60)
-                    .multilineTextAlignment(.center)
-                    .padding(.vertical, 6)
-                    .background(Color(.secondarySystemBackground))
-                    .cornerRadius(6)
-                
+                    .frame(width: 60).multilineTextAlignment(.center)
+                    .padding(.vertical, 6).background(Color(.secondarySystemBackground)).cornerRadius(6)
                 Menu {
                     ForEach(DoseUnit.allCases) { unit in
                         Button(unit.rawValue) { doseUnit = unit }
                     }
                 } label: {
-                    Text(doseUnit.rawValue)
-                        .font(.subheadline)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(Color(.secondarySystemBackground))
-                        .cornerRadius(6)
+                    Text(doseUnit.rawValue).font(.subheadline)
+                        .padding(.horizontal, 10).padding(.vertical, 8)
+                        .background(Color(.secondarySystemBackground)).cornerRadius(6)
                 }
             }
-            
             HStack(spacing: 6) {
                 ForEach(dosePresetsForUnit, id: \.self) { preset in
                     Button(action: { doseValue = preset }) {
                         Text(formatPreset(preset))
                             .font(.caption.monospacedDigit())
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
+                            .padding(.horizontal, 12).padding(.vertical, 6)
                             .background(doseValue == preset ? Color.blue.opacity(0.3) : Color(.tertiarySystemBackground))
                             .foregroundColor(doseValue == preset ? .blue : .primary)
                             .cornerRadius(6)
@@ -582,11 +447,7 @@ struct FieldMapView: View {
     }
     
     private func formatPreset(_ value: Double) -> String {
-        if value == floor(value) {
-            return String(format: "%.0f", value)
-        } else {
-            return String(format: "%.2g", value)
-        }
+        value == floor(value) ? String(format: "%.0f", value) : String(format: "%.2g", value)
     }
     
     private func updateUnitForChemical(_ chemName: String) {
@@ -604,80 +465,42 @@ struct FieldMapView: View {
     // MARK: - Tool FAB Column
     private var toolFABColumn: some View {
         VStack(spacing: 12) {
-            // Treatment tool
-            Button(action: {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    activeTool = activeTool == .treatment ? .none : .treatment
-                }
-            }) {
-                Image(systemName: "drop.fill")
-                    .font(.title2)
+            Button(action: { withAnimation(.easeInOut(duration: 0.15)) { activeTool = activeTool == .treatment ? .none : .treatment } }) {
+                Image(systemName: "drop.fill").font(.title2)
                     .foregroundColor(activeTool == .treatment ? .white : .blue)
                     .frame(width: 56, height: 56)
                     .background(activeTool == .treatment ? Color.blue : Color(.systemBackground))
-                    .clipShape(Circle())
-                    .shadow(radius: 4)
+                    .clipShape(Circle()).shadow(radius: 4)
             }
-            
-            // Larvae tool
-            Button(action: {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    activeTool = activeTool == .larvae ? .none : .larvae
-                }
-            }) {
-                Text("🦟")
-                    .font(.title2)
-                    .frame(width: 56, height: 56)
+            Button(action: { withAnimation(.easeInOut(duration: 0.15)) { activeTool = activeTool == .larvae ? .none : .larvae } }) {
+                Text("🦟").font(.title2).frame(width: 56, height: 56)
                     .background(activeTool == .larvae ? Color.green : Color(.systemBackground))
-                    .clipShape(Circle())
-                    .shadow(radius: 4)
+                    .clipShape(Circle()).shadow(radius: 4)
             }
-            
-            // Note tool
-            Button(action: {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    activeTool = activeTool == .note ? .none : .note
-                }
-            }) {
-                Image(systemName: "note.text")
-                    .font(.title2)
+            Button(action: { withAnimation(.easeInOut(duration: 0.15)) { activeTool = activeTool == .note ? .none : .note } }) {
+                Image(systemName: "note.text").font(.title2)
                     .foregroundColor(activeTool == .note ? .white : .orange)
                     .frame(width: 56, height: 56)
                     .background(activeTool == .note ? Color.orange : Color(.systemBackground))
-                    .clipShape(Circle())
-                    .shadow(radius: 4)
+                    .clipShape(Circle()).shadow(radius: 4)
             }
-            
-            // Navigate tool
             Button(action: {
                 withAnimation(.easeInOut(duration: 0.15)) {
-                    if activeTool == .navigate {
-                        activeTool = .none
-                        routeService.cancelNavigation()
-                    } else {
-                        activeTool = .navigate
-                    }
+                    if activeTool == .navigate { activeTool = .none; routeService.cancelNavigation() }
+                    else { activeTool = .navigate }
                 }
             }) {
-                Image(systemName: "location.circle.fill")
-                    .font(.title2)
+                Image(systemName: "location.circle.fill").font(.title2)
                     .foregroundColor(activeTool == .navigate ? .white : .purple)
                     .frame(width: 56, height: 56)
                     .background(activeTool == .navigate ? Color.purple : Color(.systemBackground))
-                    .clipShape(Circle())
-                    .shadow(radius: 4)
+                    .clipShape(Circle()).shadow(radius: 4)
             }
-            
-            // Undo
             if !markerStore.markers.isEmpty {
                 Button(action: undoLastMarker) {
-                    Image(systemName: "arrow.uturn.backward")
-                        .font(.title3)
-                        .foregroundColor(.orange)
+                    Image(systemName: "arrow.uturn.backward").font(.title3).foregroundColor(.orange)
                         .frame(width: 48, height: 48)
-                        .background(Color(.systemBackground))
-                        .clipShape(Circle())
-                        .shadow(radius: 2)
+                        .background(Color(.systemBackground)).clipShape(Circle()).shadow(radius: 2)
                 }
             }
         }
@@ -686,175 +509,100 @@ struct FieldMapView: View {
     // MARK: - Note Quick Picker
     private var noteQuickPicker: some View {
         ZStack {
-            Color.black.opacity(0.4)
-                .edgesIgnoringSafeArea(.all)
-                .onTapGesture {
-                    showNotePicker = false
-                    pendingNoteCoordinate = nil
-                    noteInputText = ""
-                }
-            
+            Color.black.opacity(0.4).edgesIgnoringSafeArea(.all)
+                .onTapGesture { showNotePicker = false; pendingNoteCoordinate = nil; noteInputText = "" }
             VStack(spacing: 16) {
                 HStack {
-                    Image(systemName: "note.text")
-                        .font(.title2)
-                        .foregroundColor(.orange)
-                    Text("Field Note")
-                        .font(.headline)
+                    Image(systemName: "note.text").font(.title2).foregroundColor(.orange)
+                    Text("Field Note").font(.headline)
                 }
-                
                 if let coord = pendingNoteCoordinate {
                     Text(String(format: "%.5f, %.5f", coord.latitude, coord.longitude))
-                        .font(.caption.monospacedDigit())
-                        .foregroundColor(.secondary)
+                        .font(.caption.monospacedDigit()).foregroundColor(.secondary)
                 }
-                
                 TextEditor(text: $noteInputText)
-                    .frame(height: 100)
-                    .padding(8)
-                    .background(Color(.secondarySystemBackground))
-                    .cornerRadius(8)
+                    .frame(height: 100).padding(8)
+                    .background(Color(.secondarySystemBackground)).cornerRadius(8)
                     .overlay(
                         Group {
                             if noteInputText.isEmpty {
-                                Text("Enter note...")
-                                    .foregroundColor(.secondary)
-                                    .padding(.leading, 12)
-                                    .padding(.top, 16)
-                                    .allowsHitTesting(false)
+                                Text("Enter note...").foregroundColor(.secondary)
+                                    .padding(.leading, 12).padding(.top, 16).allowsHitTesting(false)
                             }
-                        },
-                        alignment: .topLeading
+                        }, alignment: .topLeading
                     )
-                
                 HStack(spacing: 16) {
-                    Button("Cancel") {
-                        showNotePicker = false
-                        pendingNoteCoordinate = nil
-                        noteInputText = ""
-                    }
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 10)
-                    
+                    Button("Cancel") { showNotePicker = false; pendingNoteCoordinate = nil; noteInputText = "" }
+                        .foregroundColor(.secondary).padding(.horizontal, 20).padding(.vertical, 10)
                     Button(action: dropNoteMarker) {
-                        HStack {
-                            Image(systemName: "checkmark")
-                            Text("Save")
-                        }
-                        .font(.headline)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 10)
-                        .background(
-                            noteInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                ? Color.gray
-                                : Color.orange
-                        )
-                        .cornerRadius(10)
+                        HStack { Image(systemName: "checkmark"); Text("Save") }
+                            .font(.headline).foregroundColor(.white)
+                            .padding(.horizontal, 24).padding(.vertical, 10)
+                            .background(noteInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.gray : Color.orange)
+                            .cornerRadius(10)
                     }
                     .disabled(noteInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
-            .padding(24)
-            .background(Color(.systemBackground))
-            .cornerRadius(16)
-            .shadow(radius: 10)
-            .padding(32)
+            .padding(24).background(Color(.systemBackground)).cornerRadius(16).shadow(radius: 10).padding(32)
         }
     }
     
     // MARK: - Larvae Quick Picker
     private var larvaeQuickPicker: some View {
         ZStack {
-            Color.black.opacity(0.4)
-                .edgesIgnoringSafeArea(.all)
-                .onTapGesture {
-                    showLarvaePicker = false
-                    pendingLarvaeCoordinate = nil
-                }
-            
+            Color.black.opacity(0.4).edgesIgnoringSafeArea(.all)
+                .onTapGesture { showLarvaePicker = false; pendingLarvaeCoordinate = nil }
             VStack(spacing: 16) {
-                Text("Larvae Level")
-                    .font(.headline)
-                
+                Text("Larvae Level").font(.headline)
                 HStack(spacing: 12) {
                     ForEach(LarvaeLevel.allCases) { level in
                         Button(action: { selectedLarvaeLevel = level }) {
                             VStack(spacing: 4) {
                                 ZStack {
-                                    Circle()
-                                        .fill(Color(hex: level.color))
-                                        .frame(width: 44, height: 44)
+                                    Circle().fill(Color(hex: level.color)).frame(width: 44, height: 44)
                                     if selectedLarvaeLevel == level {
-                                        Circle()
-                                            .stroke(Color.primary, lineWidth: 3)
-                                            .frame(width: 52, height: 52)
+                                        Circle().stroke(Color.primary, lineWidth: 3).frame(width: 52, height: 52)
                                     }
                                 }
-                                Text(level.displayName)
-                                    .font(.caption)
+                                Text(level.displayName).font(.caption)
                                     .foregroundColor(selectedLarvaeLevel == level ? .primary : .secondary)
                             }
-                        }
-                        .buttonStyle(.plain)
+                        }.buttonStyle(.plain)
                     }
                 }
-                
                 Button(action: { pupaeSelected.toggle() }) {
                     HStack {
                         Image(systemName: pupaeSelected ? "checkmark.circle.fill" : "circle")
-                            .font(.title2)
-                            .foregroundColor(pupaeSelected ? .pink : .gray)
-                        Text("Pupae Present")
-                            .font(.headline)
+                            .font(.title2).foregroundColor(pupaeSelected ? .pink : .gray)
+                        Text("Pupae Present").font(.headline)
                         if pupaeSelected { Text("🔴") }
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
+                    .padding(.horizontal, 20).padding(.vertical, 12)
                     .background(pupaeSelected ? Color.pink.opacity(0.2) : Color(.tertiarySystemBackground))
                     .cornerRadius(10)
-                }
-                .buttonStyle(.plain)
-                
+                }.buttonStyle(.plain)
                 HStack(spacing: 16) {
-                    Button("Cancel") {
-                        showLarvaePicker = false
-                        pendingLarvaeCoordinate = nil
-                    }
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 10)
-                    
+                    Button("Cancel") { showLarvaePicker = false; pendingLarvaeCoordinate = nil }
+                        .foregroundColor(.secondary).padding(.horizontal, 20).padding(.vertical, 10)
                     Button(action: {
                         dropLarvaeMarker(level: selectedLarvaeLevel, pupae: pupaeSelected)
                         pupaeSelected = false
                     }) {
-                        HStack {
-                            Image(systemName: "checkmark")
-                            Text("Save")
-                        }
-                        .font(.headline)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 24)
-                        .padding(.vertical, 10)
-                        .background(Color.green)
-                        .cornerRadius(10)
+                        HStack { Image(systemName: "checkmark"); Text("Save") }
+                            .font(.headline).foregroundColor(.white)
+                            .padding(.horizontal, 24).padding(.vertical, 10)
+                            .background(Color.green).cornerRadius(10)
                     }
                 }
             }
-            .padding(24)
-            .background(Color(.systemBackground))
-            .cornerRadius(16)
-            .shadow(radius: 10)
-            .padding(32)
+            .padding(24).background(Color(.systemBackground)).cornerRadius(16).shadow(radius: 10).padding(32)
         }
     }
     
     // MARK: - Bottom Bar
     private var bottomBar: some View {
         HStack(spacing: 12) {
-            // Follow button
             Button(action: { navigationService.toggleFollow() }) {
                 Image(systemName: navigationService.isFollowing ? "location.fill" : "location")
                     .font(.body)
@@ -863,59 +611,32 @@ struct FieldMapView: View {
                     .background(navigationService.isFollowing ? Color.blue : Color(.secondarySystemBackground))
                     .clipShape(Circle())
             }
-            
-            // GPS status + coordinates
             HStack(spacing: 6) {
-                Circle()
-                    .fill(navigationService.hasLocation ? Color.green : Color.red)
-                    .frame(width: 8, height: 8)
+                Circle().fill(navigationService.hasLocation ? Color.green : Color.red).frame(width: 8, height: 8)
                 if let location = navigationService.location {
                     Text(String(format: "%.4f, %.4f", location.coordinate.latitude, location.coordinate.longitude))
                         .font(.caption.monospacedDigit())
                 }
             }
-            
-            // Speed
             if let speed = navigationService.speedMPH, speed >= 1 {
-                Text(String(format: "%.0f mph", speed))
-                    .font(.caption.bold().monospacedDigit())
-                    .foregroundColor(.secondary)
+                Text(String(format: "%.0f mph", speed)).font(.caption.bold().monospacedDigit()).foregroundColor(.secondary)
             }
-            
-            // Heading cardinal
             if navigationService.hasHeading {
-                Text(headingCardinal(navigationService.heading))
-                    .font(.caption.bold())
-                    .foregroundColor(.secondary)
+                Text(headingCardinal(navigationService.heading)).font(.caption.bold()).foregroundColor(.secondary)
             }
-            
             Spacer()
-            
-            // Active tool indicator
             if activeTool != .none {
-                Text(toolIndicatorText)
-                    .font(.caption.bold())
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(toolIndicatorColor)
-                    .cornerRadius(12)
+                Text(toolIndicatorText).font(.caption.bold()).foregroundColor(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(toolIndicatorColor).cornerRadius(12)
             }
-            
-            // Marker count
             if markerStore.markers.count > 0 {
-                Text("\(markerStore.markers.count)")
-                    .font(.caption.bold())
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(Color.orange)
-                    .clipShape(Capsule())
+                Text("\(markerStore.markers.count)").font(.caption.bold()).foregroundColor(.white)
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(Color.orange).clipShape(Capsule())
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
+        .padding(.horizontal, 16).padding(.vertical, 10).background(.ultraThinMaterial)
     }
     
     private var toolIndicatorText: String {
@@ -944,7 +665,6 @@ struct FieldMapView: View {
         return directions[index]
     }
     
-    // MARK: - Undo
     private func undoLastMarker() {
         guard !markerStore.markers.isEmpty else { return }
         markerStore.markers.removeLast()
@@ -961,7 +681,7 @@ struct FieldMapView: View {
 struct SpatialMapView: UIViewRepresentable {
     @Binding var region: MKCoordinateRegion
     let markers: [FieldMarker]
-    let refreshTrigger: Int  // <-- Added to force updates
+    let refreshTrigger: Int
     @ObservedObject var spatialService: SpatialService
     @ObservedObject var layerVisibility: LayerVisibility
     @ObservedObject var treatmentStatusService: TreatmentStatusService
@@ -975,7 +695,6 @@ struct SpatialMapView: UIViewRepresentable {
         let mapView = MKMapView()
         context.coordinator.mapViewRef = mapView
         mapView.delegate = context.coordinator
-        // We draw our own heading arrow — don't use MapKit's blue dot
         mapView.showsUserLocation = false
         mapView.setRegion(region, animated: false)
         
@@ -986,36 +705,60 @@ struct SpatialMapView: UIViewRepresentable {
         let mapCache = MapCache(withConfig: config)
         mapView.useCache(mapCache)
         
+        // Add HeadingArrowView as a subview — NOT an overlay
+        let arrowView = HeadingArrowView()
+        arrowView.mapView = mapView
+        mapView.addSubview(arrowView)
+        context.coordinator.headingArrowView = arrowView
+        
+        // Wire direct GPS callback (bypasses SwiftUI entirely for arrow updates)
+        context.coordinator.setupDirectGPSCallback()
+        
         return mapView
     }
     
     func updateUIView(_ mapView: MKMapView, context: Context) {
         context.coordinator.parent = self
-        context.coordinator.updateCount += 1
         
-        // Force SwiftUI to track these for re-render
+        // --- DIRTY FLAG EVALUATION ---
+        // GPS ticks do NOT trigger spatial updates. The arrow view handles those
+        // directly via onLocationUpdate callback from NavigationService.
+        
+        let coord = context.coordinator
+        let spatialDirty = coord.checkSpatialDirty()
+        let markersDirty = coord.checkMarkersDirty(markers: markers)
+        let routeDirty = coord.checkRouteDirty(routePolyline: routeService.routePolyline)
+        
+        if spatialDirty { coord.updateSpatialLayers(mapView: mapView) }
+        if markersDirty { coord.updateMarkers(mapView: mapView, markers: markers) }
+        if routeDirty { coord.updateRouteOverlay(mapView: mapView, routePolyline: routeService.routePolyline) }
+        
+        // Still read these so SwiftUI calls us when they change (for bottom bar)
         let _ = navigationService.location
         let _ = navigationService.heading
         let _ = navigationService.isFollowing
-        let _ = refreshTrigger  // <-- Track refresh trigger
+        let _ = refreshTrigger
         
-        context.coordinator.updateSpatialLayers(mapView: mapView)
-        context.coordinator.updateMarkers(mapView: mapView, markers: markers)
-        context.coordinator.updateNavigation(mapView: mapView)
-        context.coordinator.updateRouteOverlay(mapView: mapView, routePolyline: routeService.routePolyline)
+        // Snap to truck immediately when follow mode is activated
+        let isFollowing = navigationService.isFollowing
+        if isFollowing && !coord.lastIsFollowing {
+            coord.snapToTruck()
+        }
+        coord.lastIsFollowing = isFollowing
     }
     
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
-    }
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
     
     class Coordinator: NSObject, MKMapViewDelegate {
         var parent: SpatialMapView
-        var updateCount = 0
         weak var mapViewRef: MKMapView?
         private var markerObserver: Any?
         private var justAddedViaNotification: Set<UUID> = []
         
+        /// GPU-composited heading arrow (replaces HeadingArrowOverlay)
+        var headingArrowView: HeadingArrowView?
+        
+        // Spatial layer tracking
         private var currentBoundaryIds: Set<String> = []
         private var hasFieldOverlay = false
         private var hasPolylineOverlay = false
@@ -1026,8 +769,18 @@ struct SpatialMapView: UIViewRepresentable {
         private var lastPointSiteCount = 0
         private var lastStormDrainCount = 0
         private var lastStatusVersion = 0
-        private var hasHeadingOverlay = false
         private var hasRouteOverlay = false
+        
+        // Dirty flag snapshots
+        private var lastBoundaryCount = 0
+        private var lastShowFields = true
+        private var lastShowPolylines = true
+        private var lastShowPointSites = true
+        private var lastShowStormDrains = true
+        private var lastShowBoundaries = true
+        private var lastMarkerCount = 0
+        private var lastRoutePolyline: MKPolyline? = nil
+        var lastIsFollowing = false
         
         init(_ parent: SpatialMapView) {
             self.parent = parent
@@ -1039,12 +792,9 @@ struct SpatialMapView: UIViewRepresentable {
                 guard let self,
                       let marker = notification.object as? FieldMarker,
                       let mapView = self.mapViewRef else { return }
-                
                 self.justAddedViaNotification.insert(marker.id)
                 let annotation = MarkerAnnotation(marker: marker)
                 mapView.addAnnotation(annotation)
-                
-                // Force annotation to appear by selecting and deselecting it
                 mapView.selectAnnotation(annotation, animated: false)
                 mapView.deselectAnnotation(annotation, animated: false)
             }
@@ -1054,14 +804,105 @@ struct SpatialMapView: UIViewRepresentable {
             if let observer = markerObserver {
                 NotificationCenter.default.removeObserver(observer)
             }
+            parent.navigationService.onLocationUpdate = nil
         }
+        
+        // MARK: - Direct GPS Callback (bypasses SwiftUI entirely)
+        
+        func setupDirectGPSCallback() {
+            parent.navigationService.onLocationUpdate = { [weak self] location, heading in
+                guard let self,
+                      let mapView = self.mapViewRef,
+                      let arrowView = self.headingArrowView,
+                      UIApplication.shared.applicationState == .active else { return }
+                
+                // Move arrow — GPU composited, sub-millisecond
+                arrowView.updatePosition(
+                    coordinate: location.coordinate,
+                    heading: heading,
+                    accuracy: location.horizontalAccuracy,
+                    animated: true
+                )
+                
+                // Follow mode — pan map to keep truck centered
+                let nav = self.parent.navigationService
+                if nav.isFollowing {
+                    let currentCenter = mapView.centerCoordinate
+                    let distance = location.distance(from: CLLocation(
+                        latitude: currentCenter.latitude,
+                        longitude: currentCenter.longitude
+                    ))
+                    if distance > 5 {
+                        let followRegion = MKCoordinateRegion(
+                            center: location.coordinate,
+                            span: MKCoordinateSpan(latitudeDelta: nav.followZoomSpan, longitudeDelta: nav.followZoomSpan)
+                        )
+                        mapView.setRegion(followRegion, animated: true)
+                    }
+                }
+            }
+        }
+        
+        /// Called when follow mode is toggled — immediately pans to truck
+        func snapToTruck() {
+            let nav = parent.navigationService
+            guard let mapView = mapViewRef,
+                  let location = nav.location else { return }
+            
+            let followRegion = MKCoordinateRegion(
+                center: location.coordinate,
+                span: MKCoordinateSpan(latitudeDelta: nav.followZoomSpan, longitudeDelta: nav.followZoomSpan)
+            )
+            mapView.setRegion(followRegion, animated: true)
+        }
+        
+        // MARK: - Dirty Flag Checks
+        
+        func checkSpatialDirty() -> Bool {
+            let service = parent.spatialService
+            let visibility = parent.layerVisibility
+            let statusVersion = parent.treatmentStatusService.statusVersion
+            
+            let dirty = service.fields.count != lastFieldCount
+                || service.polylines.count != lastPolylineCount
+                || service.pointSites.count != lastPointSiteCount
+                || service.stormDrains.count != lastStormDrainCount
+                || service.boundaries.count != lastBoundaryCount
+                || visibility.showFields != lastShowFields
+                || visibility.showPolylines != lastShowPolylines
+                || visibility.showPointSites != lastShowPointSites
+                || visibility.showStormDrains != lastShowStormDrains
+                || visibility.showBoundaries != lastShowBoundaries
+                || statusVersion != lastStatusVersion
+            
+            lastBoundaryCount = service.boundaries.count
+            lastShowFields = visibility.showFields
+            lastShowPolylines = visibility.showPolylines
+            lastShowPointSites = visibility.showPointSites
+            lastShowStormDrains = visibility.showStormDrains
+            lastShowBoundaries = visibility.showBoundaries
+            
+            return dirty
+        }
+        
+        func checkMarkersDirty(markers: [FieldMarker]) -> Bool {
+            let dirty = markers.count != lastMarkerCount
+            lastMarkerCount = markers.count
+            return dirty
+        }
+        
+        func checkRouteDirty(routePolyline: MKPolyline?) -> Bool {
+            let dirty = routePolyline !== lastRoutePolyline
+            lastRoutePolyline = routePolyline
+            return dirty
+        }
+        
+        // MARK: - Tap Handling
         
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
             guard let mapView = gesture.view as? MKMapView else { return }
             let point = gesture.location(in: mapView)
             let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
-            
-            // Convert to screen coordinates for overlay positioning
             let screenPoint = gesture.location(in: mapView.superview ?? mapView)
             
             let service = parent.spatialService
@@ -1078,9 +919,7 @@ struct SpatialMapView: UIViewRepresentable {
             )
             
             if toolActive {
-                // Dismiss any open annotation callouts
                 mapView.selectedAnnotations.forEach { mapView.deselectAnnotation($0, animated: false) }
-                
                 removeSelectionHighlight(mapView: mapView)
                 parent.onTap(coordinate, screenPoint)
             } else {
@@ -1109,8 +948,7 @@ struct SpatialMapView: UIViewRepresentable {
                     let titled = TitledOverlay(overlay: polyline, type: .polyline, id: "SELECTED_POLYLINE")
                     mapView.addOverlay(titled, level: .aboveLabels)
                 }
-            default:
-                break
+            default: break
             }
         }
         
@@ -1123,61 +961,11 @@ struct SpatialMapView: UIViewRepresentable {
             if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
         }
         
-        // MARK: - Navigation Update
-        
-        func updateNavigation(mapView: MKMapView) {
-            let nav = parent.navigationService
-            
-            guard nav.hasLocation, let location = nav.location else {
-                if hasHeadingOverlay { removeHeadingOverlay(mapView: mapView) }
-                return
-            }
-            
-            // Update heading arrow
-            updateHeadingOverlay(
-                mapView: mapView,
-                coordinate: location.coordinate,
-                heading: nav.heading,
-                accuracy: location.horizontalAccuracy
-            )
-            
-            // Follow mode: keep user centered
-            if nav.isFollowing {
-                let currentCenter = mapView.centerCoordinate
-                let distance = location.distance(from: CLLocation(latitude: currentCenter.latitude, longitude: currentCenter.longitude))
-                
-                // Only pan if moved >5m (avoids jitter)
-                if distance > 5 {
-                    let followRegion = MKCoordinateRegion(
-                        center: location.coordinate,
-                        span: MKCoordinateSpan(latitudeDelta: nav.followZoomSpan, longitudeDelta: nav.followZoomSpan)
-                    )
-                    mapView.setRegion(followRegion, animated: true)
-                }
-            }
-        }
-        
-        private func updateHeadingOverlay(mapView: MKMapView, coordinate: CLLocationCoordinate2D, heading: CLLocationDirection, accuracy: CLLocationAccuracy) {
-            removeHeadingOverlay(mapView: mapView)
-            let arrow = HeadingArrowOverlay(coordinate: coordinate, heading: heading, accuracy: accuracy)
-            mapView.addOverlay(arrow, level: .aboveLabels)
-            hasHeadingOverlay = true
-        }
-        
-        private func removeHeadingOverlay(mapView: MKMapView) {
-            let toRemove = mapView.overlays.filter { $0 is HeadingArrowOverlay }
-            if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
-            hasHeadingOverlay = false
-        }
-        
         // MARK: - Route Overlay
         
         func updateRouteOverlay(mapView: MKMapView, routePolyline: MKPolyline?) {
-            // Remove existing route
             let toRemove = mapView.overlays.filter { $0 is MKPolyline && ($0 as? MKPolyline)?.title == "ROUTE" }
             if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
-            
-            // Add new route if present
             if let polyline = routePolyline {
                 polyline.title = "ROUTE"
                 mapView.addOverlay(polyline, level: .aboveLabels)
@@ -1187,10 +975,9 @@ struct SpatialMapView: UIViewRepresentable {
             }
         }
         
-        // MARK: - Detect User Pan (disable follow)
+        // MARK: - Map Region Change Delegates
         
         func mapView(_ mapView: MKMapView, regionWillChangeAnimated animated: Bool) {
-            // If user is dragging/pinching the map, disable follow mode
             if let view = mapView.subviews.first,
                let recognizers = view.gestureRecognizers {
                 for recognizer in recognizers {
@@ -1204,12 +991,21 @@ struct SpatialMapView: UIViewRepresentable {
             }
         }
         
+        // Reposition arrow DURING pan/zoom (fires continuously while gesture is active)
+        func mapViewDidChangeVisibleRegion(_ mapView: MKMapView) {
+            headingArrowView?.repositionOnMap()
+        }
+        
+        // Reposition arrow AFTER pan/zoom completes (final snap to correct position)
+        func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            headingArrowView?.repositionOnMap()
+        }
+        
         // MARK: - Update Spatial Layers
         
         func updateSpatialLayers(mapView: MKMapView) {
             let service = parent.spatialService
             let visibility = parent.layerVisibility
-            
             updateBoundaries(mapView: mapView, show: visibility.showBoundaries, data: service.boundaries)
             updateFieldsComposite(mapView: mapView, show: visibility.showFields, data: service.fields)
             updatePolylinesComposite(mapView: mapView, show: visibility.showPolylines, data: service.polylines)
@@ -1245,14 +1041,11 @@ struct SpatialMapView: UIViewRepresentable {
             let visibilityChanged = show != hasFieldOverlay
             let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
             guard dataChanged || visibilityChanged || statusChanged else { return }
-            
             let toRemove = mapView.overlays.filter { $0 is CompositeFieldOverlay }
             if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
             if show && !data.isEmpty {
                 let statusService = parent.treatmentStatusService
-                let composite = CompositeFieldOverlay(fields: data) { featureId in
-                    statusService.colorForFeature(featureId)
-                }
+                let composite = CompositeFieldOverlay(fields: data) { featureId in statusService.colorForFeature(featureId) }
                 mapView.addOverlay(composite, level: .aboveLabels)
             }
             hasFieldOverlay = show && !data.isEmpty
@@ -1264,14 +1057,11 @@ struct SpatialMapView: UIViewRepresentable {
             let visibilityChanged = show != hasPolylineOverlay
             let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
             guard dataChanged || visibilityChanged || statusChanged else { return }
-            
             let toRemove = mapView.overlays.filter { $0 is CompositePolylineOverlay }
             if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
             if show && !data.isEmpty {
                 let statusService = parent.treatmentStatusService
-                let composite = CompositePolylineOverlay(polylines: data) { featureId in
-                    statusService.colorForFeature(featureId)
-                }
+                let composite = CompositePolylineOverlay(polylines: data) { featureId in statusService.colorForFeature(featureId) }
                 mapView.addOverlay(composite, level: .aboveLabels)
             }
             hasPolylineOverlay = show && !data.isEmpty
@@ -1283,21 +1073,13 @@ struct SpatialMapView: UIViewRepresentable {
             let visibilityChanged = show != hasPointSiteOverlay
             let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
             guard dataChanged || visibilityChanged || statusChanged else { return }
-            
-            // Remove existing overlay
-            let toRemove = mapView.overlays.filter {
-                ($0 as? CompositePointOverlay)?.pointType == .pointSite
-            }
+            let toRemove = mapView.overlays.filter { ($0 as? CompositePointOverlay)?.pointType == .pointSite }
             if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
-            
             if show && !data.isEmpty {
                 let statusService = parent.treatmentStatusService
-                let composite = CompositePointOverlay(pointSites: data) { featureId in
-                    statusService.colorForFeature(featureId)
-                }
+                let composite = CompositePointOverlay(pointSites: data) { featureId in statusService.colorForFeature(featureId) }
                 mapView.addOverlay(composite, level: .aboveLabels)
             }
-            
             hasPointSiteOverlay = show && !data.isEmpty
             lastPointSiteCount = data.count
         }
@@ -1307,21 +1089,13 @@ struct SpatialMapView: UIViewRepresentable {
             let visibilityChanged = show != hasStormDrainOverlay
             let statusChanged = parent.treatmentStatusService.statusVersion != lastStatusVersion
             guard dataChanged || visibilityChanged || statusChanged else { return }
-            
-            // Remove existing overlay
-            let toRemove = mapView.overlays.filter {
-                ($0 as? CompositePointOverlay)?.pointType == .stormDrain
-            }
+            let toRemove = mapView.overlays.filter { ($0 as? CompositePointOverlay)?.pointType == .stormDrain }
             if !toRemove.isEmpty { mapView.removeOverlays(toRemove) }
-            
             if show && !data.isEmpty {
                 let statusService = parent.treatmentStatusService
-                let composite = CompositePointOverlay(stormDrains: data) { featureId in
-                    statusService.colorForFeature(featureId)
-                }
+                let composite = CompositePointOverlay(stormDrains: data) { featureId in statusService.colorForFeature(featureId) }
                 mapView.addOverlay(composite, level: .aboveLabels)
             }
-            
             hasStormDrainOverlay = show && !data.isEmpty
             lastStormDrainCount = data.count
         }
@@ -1332,30 +1106,21 @@ struct SpatialMapView: UIViewRepresentable {
             let existingAnnotations = mapView.annotations.compactMap { $0 as? MarkerAnnotation }
             let existingIds = Set(existingAnnotations.map { $0.marker.id })
             let newIds = Set(markers.map { $0.id })
-            
-            // Only remove if marker was deleted (not in store anymore)
-            // Don't remove markers that exist on map but aren't in the passed array yet
             let markersInStore = Set(MarkerStore.shared.markers.map { $0.id })
             let toRemove = existingAnnotations.filter {
                 !markersInStore.contains($0.marker.id) && !justAddedViaNotification.contains($0.marker.id)
             }
             if !toRemove.isEmpty { mapView.removeAnnotations(toRemove) }
-            
-            // Clear the protection for IDs that are now in the markers array
             justAddedViaNotification = justAddedViaNotification.subtracting(newIds)
-            
             let idsToAdd = newIds.subtracting(existingIds)
             let toAdd = markers.filter { idsToAdd.contains($0.id) }
-            for marker in toAdd {
-                mapView.addAnnotation(MarkerAnnotation(marker: marker))
-            }
+            for marker in toAdd { mapView.addAnnotation(MarkerAnnotation(marker: marker)) }
         }
         
         // MARK: - MKMapViewDelegate
         
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if annotation is MKUserLocation { return nil }
-            
             if let markerAnnotation = annotation as? MarkerAnnotation {
                 let identifier = "FieldMarker"
                 var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier)
@@ -1367,20 +1132,10 @@ struct SpatialMapView: UIViewRepresentable {
                 view?.image = markerAnnotation.markerImage
                 return view
             }
-            
-            // SpatialAnnotations are no longer used - point sites and storm drains
-            // are now rendered via CompositePointOverlay for better performance
-            
             return nil
         }
         
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
-            // Heading arrow
-            if overlay is HeadingArrowOverlay {
-                return HeadingArrowRenderer(overlay: overlay)
-            }
-            
-            // Selected field highlight
             if let polygon = overlay as? MKPolygon, polygon.title == "SELECTED_FIELD" {
                 let r = MKPolygonRenderer(polygon: polygon)
                 r.strokeColor = UIColor.systemYellow
@@ -1388,31 +1143,21 @@ struct SpatialMapView: UIViewRepresentable {
                 r.lineWidth = 3
                 return r
             }
-            
-            // Route polyline (navigation)
             if let polyline = overlay as? MKPolyline, polyline.title == "ROUTE" {
                 let r = MKPolylineRenderer(polyline: polyline)
                 r.strokeColor = UIColor.systemBlue
                 r.lineWidth = 6
                 return r
             }
-            
-            // Composite field overlay
             if let composite = overlay as? CompositeFieldOverlay {
                 return CompositeFieldRenderer(overlay: composite)
             }
-            
-            // Composite polyline overlay
             if let composite = overlay as? CompositePolylineOverlay {
                 return CompositePolylineRenderer(overlay: composite)
             }
-            
-            // Composite point overlay (point sites and storm drains)
             if let composite = overlay as? CompositePointOverlay {
                 return CompositePointRenderer(overlay: composite)
             }
-            
-            // Titled overlays (boundaries + selected polyline)
             if let titled = overlay as? TitledOverlay {
                 switch titled.layerType {
                 case .boundary:
@@ -1432,68 +1177,40 @@ struct SpatialMapView: UIViewRepresentable {
                     if let polyline = titled.wrappedOverlay as? MKPolyline {
                         let r = MKPolylineRenderer(polyline: polyline)
                         if titled.identifier == "SELECTED_POLYLINE" {
-                            r.strokeColor = UIColor.systemYellow
-                            r.lineWidth = 4
+                            r.strokeColor = UIColor.systemYellow; r.lineWidth = 4
                         } else {
-                            r.strokeColor = UIColor.cyan.withAlphaComponent(0.8)
-                            r.lineWidth = 2
+                            r.strokeColor = UIColor.cyan.withAlphaComponent(0.8); r.lineWidth = 2
                         }
                         return r
                     }
-                default:
-                    break
+                default: break
                 }
             }
-            
-            // MapCache tiles
             return mapView.mapCacheRenderer(forOverlay: overlay)
         }
     }
 }
-// MARK: - Supporting Types (shared)
 
-enum SpatialLayerType {
-    case boundary
-    case field
-    case polyline
-    case pointSite
-    case stormDrain
-}
+// MARK: - Supporting Types
+
+enum SpatialLayerType { case boundary, field, polyline, pointSite, stormDrain }
 
 class TitledOverlay: NSObject, MKOverlay {
-    let wrappedOverlay: MKOverlay
-    let layerType: SpatialLayerType
-    let identifier: String
-    let overlayTitle: String?
-    
+    let wrappedOverlay: MKOverlay; let layerType: SpatialLayerType; let identifier: String; let overlayTitle: String?
     init(overlay: MKOverlay, type: SpatialLayerType, id: String, title: String? = nil) {
-        self.wrappedOverlay = overlay
-        self.layerType = type
-        self.identifier = id
-        self.overlayTitle = title
+        self.wrappedOverlay = overlay; self.layerType = type; self.identifier = id; self.overlayTitle = title
     }
-    
     var coordinate: CLLocationCoordinate2D { wrappedOverlay.coordinate }
     var boundingMapRect: MKMapRect { wrappedOverlay.boundingMapRect }
 }
 
 class SpatialAnnotation: NSObject, MKAnnotation {
-    let coordinate: CLLocationCoordinate2D
-    let layerType: SpatialLayerType
-    let identifier: String
-    let annotationTitle: String?
-    let color: String
-    
+    let coordinate: CLLocationCoordinate2D; let layerType: SpatialLayerType; let identifier: String
+    let annotationTitle: String?; let color: String
     var title: String? { annotationTitle }
-    
     init(coordinate: CLLocationCoordinate2D, type: SpatialLayerType, id: String, title: String?, color: String) {
-        self.coordinate = coordinate
-        self.layerType = type
-        self.identifier = id
-        self.annotationTitle = title
-        self.color = color
+        self.coordinate = coordinate; self.layerType = type; self.identifier = id; self.annotationTitle = title; self.color = color
     }
-    
     var markerImage: UIImage {
         let size = CGSize(width: 20, height: 20)
         let renderer = UIGraphicsImageRenderer(size: size)
@@ -1502,20 +1219,15 @@ class SpatialAnnotation: NSObject, MKAnnotation {
             let uiColor = UIColor(Color(hex: color))
             switch layerType {
             case .pointSite:
-                uiColor.setFill()
-                UIColor.white.setStroke()
-                ctx.setLineWidth(1.5)
+                uiColor.setFill(); UIColor.white.setStroke(); ctx.setLineWidth(1.5)
                 ctx.fillEllipse(in: CGRect(x: 2, y: 2, width: 16, height: 16))
                 ctx.strokeEllipse(in: CGRect(x: 2, y: 2, width: 16, height: 16))
             case .stormDrain:
-                uiColor.setFill()
-                UIColor.white.setStroke()
-                ctx.setLineWidth(1)
+                uiColor.setFill(); UIColor.white.setStroke(); ctx.setLineWidth(1)
                 ctx.fill(CGRect(x: 4, y: 4, width: 12, height: 12))
                 ctx.stroke(CGRect(x: 4, y: 4, width: 12, height: 12))
             default:
-                uiColor.setFill()
-                ctx.fillEllipse(in: CGRect(x: 2, y: 2, width: 16, height: 16))
+                uiColor.setFill(); ctx.fillEllipse(in: CGRect(x: 2, y: 2, width: 16, height: 16))
             }
         }
     }
@@ -1525,78 +1237,46 @@ class MarkerAnnotation: NSObject, MKAnnotation {
     let marker: FieldMarker
     var coordinate: CLLocationCoordinate2D { marker.coordinate }
     var title: String? { nil }
-    
-    init(marker: FieldMarker) {
-        self.marker = marker
-    }
-    
+    init(marker: FieldMarker) { self.marker = marker }
     var markerImage: UIImage {
         let size = CGSize(width: 24, height: 24)
         let renderer = UIGraphicsImageRenderer(size: size)
         return renderer.image { context in
             let ctx = context.cgContext
-            
-            // Note marker — flag shape
             if marker.isNote {
-                // Flag pole
-                UIColor.orange.setStroke()
-                ctx.setLineWidth(2)
-                ctx.move(to: CGPoint(x: 6, y: 4))
-                ctx.addLine(to: CGPoint(x: 6, y: 22))
-                ctx.strokePath()
-                
-                // Flag body
+                UIColor.orange.setStroke(); ctx.setLineWidth(2)
+                ctx.move(to: CGPoint(x: 6, y: 4)); ctx.addLine(to: CGPoint(x: 6, y: 22)); ctx.strokePath()
                 UIColor.orange.setFill()
                 let flagPath = UIBezierPath()
                 flagPath.move(to: CGPoint(x: 6, y: 4))
                 flagPath.addLine(to: CGPoint(x: 20, y: 7))
                 flagPath.addLine(to: CGPoint(x: 6, y: 12))
-                flagPath.close()
-                flagPath.fill()
-                
-                // White outline for visibility
-                UIColor.white.setStroke()
-                ctx.setLineWidth(1)
-                flagPath.stroke()
-                
+                flagPath.close(); flagPath.fill()
+                UIColor.white.setStroke(); ctx.setLineWidth(1); flagPath.stroke()
                 return
             }
-            
-            // Larvae marker — colored dot
             if let larvae = marker.larvae {
                 let color = UIColor(Color(hex: LarvaeLevel(rawValue: larvae)?.color ?? "#2e8b57"))
-                color.setFill()
-                ctx.fillEllipse(in: CGRect(x: 6, y: 6, width: 12, height: 12))
+                color.setFill(); ctx.fillEllipse(in: CGRect(x: 6, y: 6, width: 12, height: 12))
                 if marker.pupaePresent {
-                    UIColor.systemPink.setStroke()
-                    ctx.setLineWidth(2)
+                    UIColor.systemPink.setStroke(); ctx.setLineWidth(2)
                     ctx.strokeEllipse(in: CGRect(x: 4, y: 4, width: 16, height: 16))
                 }
-            }
-            // Treatment marker — diamond outline
-            else if let family = marker.family {
+            } else if let family = marker.family {
                 let colorHex = marker.status == "OBSERVED" ? "#2e8b57" : (TreatmentFamily(rawValue: family)?.color ?? "#ffca28")
                 let color = UIColor(Color(hex: colorHex))
-                color.setStroke()
-                ctx.setLineWidth(2)
+                color.setStroke(); ctx.setLineWidth(2)
                 let path = UIBezierPath()
-                path.move(to: CGPoint(x: 12, y: 2))
-                path.addLine(to: CGPoint(x: 22, y: 12))
-                path.addLine(to: CGPoint(x: 12, y: 22))
-                path.addLine(to: CGPoint(x: 2, y: 12))
-                path.close()
-                path.stroke()
+                path.move(to: CGPoint(x: 12, y: 2)); path.addLine(to: CGPoint(x: 22, y: 12))
+                path.addLine(to: CGPoint(x: 12, y: 22)); path.addLine(to: CGPoint(x: 2, y: 12))
+                path.close(); path.stroke()
             }
         }
     }
 }
 
 enum SelectedFeature {
-    case field(FieldPolygon)
-    case polyline(SpatialPolyline)
-    case pointSite(PointSite)
-    case stormDrain(StormDrain)
-    
+    case field(FieldPolygon), polyline(SpatialPolyline), pointSite(PointSite), stormDrain(StormDrain)
     var title: String {
         switch self {
         case .field(let f): return f.displayName
@@ -1605,13 +1285,10 @@ enum SelectedFeature {
         case .stormDrain(let d): return d.name ?? "Storm Drain"
         }
     }
-    
     var layerType: String {
         switch self {
-        case .field: return "Field"
-        case .polyline: return "Ditch/Canal"
-        case .pointSite: return "Point Site"
-        case .stormDrain: return "Storm Drain"
+        case .field: return "Field"; case .polyline: return "Ditch/Canal"
+        case .pointSite: return "Point Site"; case .stormDrain: return "Storm Drain"
         }
     }
 }
@@ -1620,7 +1297,6 @@ struct FeatureInfoView: View {
     let feature: SelectedFeature
     @ObservedObject var treatmentStatusService = TreatmentStatusService.shared
     @Environment(\.dismiss) var dismiss
-    
     var body: some View {
         NavigationView {
             List {
@@ -1632,24 +1308,15 @@ struct FeatureInfoView: View {
                 case .stormDrain(let drain): stormDrainInfo(drain)
                 }
             }
-            .navigationTitle(feature.title)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { dismiss() }
-                }
-            }
+            .navigationTitle(feature.title).navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } } }
         }
     }
-    
-    @ViewBuilder
-    private var treatmentStatusSection: some View {
+    @ViewBuilder private var treatmentStatusSection: some View {
         let featureId: String = {
             switch feature {
-            case .field(let f): return f.id
-            case .polyline(let p): return p.id
-            case .pointSite(let s): return s.id
-            case .stormDrain(let d): return d.id
+            case .field(let f): return f.id; case .polyline(let p): return p.id
+            case .pointSite(let s): return s.id; case .stormDrain(let d): return d.id
             }
         }()
         let status = treatmentStatusService.statusForFeature(featureId)
@@ -1657,10 +1324,7 @@ struct FeatureInfoView: View {
             HStack {
                 Circle().fill(Color(hex: status.color)).frame(width: 16, height: 16)
                 Text(status.statusText).font(.headline).foregroundColor(statusTextColor(status.color))
-                if status.isLocalOverride {
-                    Spacer()
-                    Text("⏳ pending sync").font(.caption).foregroundColor(.secondary)
-                }
+                if status.isLocalOverride { Spacer(); Text("⏳ pending sync").font(.caption).foregroundColor(.secondary) }
             }
             if let daysSince = status.daysSince { infoRow("Days Since Treatment", "\(daysSince)") }
             infoRow("Last Treated", status.formattedLastTreated)
@@ -1669,19 +1333,14 @@ struct FeatureInfoView: View {
             infoRow("Cycle", "\(status.cycleDays) days")
         }
     }
-    
     private func statusTextColor(_ hex: String) -> Color {
         switch hex {
-        case TreatmentColors.fresh: return .green
-        case TreatmentColors.recent: return .yellow
-        case TreatmentColors.aging: return .orange
-        case TreatmentColors.overdue, TreatmentColors.never: return .red
+        case TreatmentColors.fresh: return .green; case TreatmentColors.recent: return .yellow
+        case TreatmentColors.aging: return .orange; case TreatmentColors.overdue, TreatmentColors.never: return .red
         default: return .primary
         }
     }
-    
-    @ViewBuilder
-    private func fieldInfo(_ field: FieldPolygon) -> some View {
+    @ViewBuilder private func fieldInfo(_ field: FieldPolygon) -> some View {
         Section("Identification") {
             if let name = field.name { infoRow("Name", name) }
             if let zone = field.zone { infoRow("Zone", zone) }
@@ -1696,9 +1355,7 @@ struct FeatureInfoView: View {
             if let active = field.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
-    
-    @ViewBuilder
-    private func polylineInfo(_ line: SpatialPolyline) -> some View {
+    @ViewBuilder private func polylineInfo(_ line: SpatialPolyline) -> some View {
         Section("Identification") {
             if let name = line.name { infoRow("Name", name) }
             if let zone = line.zone { infoRow("Zone", zone) }
@@ -1712,9 +1369,7 @@ struct FeatureInfoView: View {
             if let active = line.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
-    
-    @ViewBuilder
-    private func pointSiteInfo(_ site: PointSite) -> some View {
+    @ViewBuilder private func pointSiteInfo(_ site: PointSite) -> some View {
         Section("Identification") {
             if let name = site.name { infoRow("Name", name) }
             if let zone = site.zone { infoRow("Zone", zone) }
@@ -1727,9 +1382,7 @@ struct FeatureInfoView: View {
             if let active = site.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
-    
-    @ViewBuilder
-    private func stormDrainInfo(_ drain: StormDrain) -> some View {
+    @ViewBuilder private func stormDrainInfo(_ drain: StormDrain) -> some View {
         Section("Identification") {
             if let name = drain.name { infoRow("Name", name) }
             if let zone = drain.zone { infoRow("Zone", zone) }
@@ -1740,16 +1393,9 @@ struct FeatureInfoView: View {
             if let symbology = drain.symbology { infoRow("Status", symbology) }
         }
     }
-    
     private func infoRow(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(label).foregroundColor(.secondary)
-            Spacer()
-            Text(value)
-        }
+        HStack { Text(label).foregroundColor(.secondary); Spacer(); Text(value) }
     }
 }
 
-#Preview {
-    FieldMapView()
-}
+#Preview { FieldMapView() }

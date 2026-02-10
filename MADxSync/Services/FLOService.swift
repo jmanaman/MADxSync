@@ -1,25 +1,39 @@
+//
+//  FLOService.swift
+//  MADxSync
+//
+//  Handles all HTTP communication with the FLO ESP32 hardware.
+//  Base URL: http://192.168.4.1 (FLO WiFi AP)
+//
+//  HARDENED: 2026-02-09 — Network-aware polling, pause/resume for lifecycle,
+//  FLO WiFi detection via NetworkMonitor, no polling when not on FLO WiFi.
+//
+//  Key endpoints:
+//  - GET /identity → truck name, firmware
+//  - GET /gps → position, satellites, speed
+//  - GET /get_totals → gallons & chemical oz
+//  - GET /get_relay_status → "1,0,0" for 3 relays
+//  - GET /get_relay_names → custom relay names
+//  - POST /cmd?data=RELAY=1,on → toggle relay
+//  - POST /cmd?data=SWEEP_ENABLE → enable sweep
+//  - GET /daylog/list → list CSV files for sync
+//  - GET /daylog/download?name=X.csv → download specific file
+
 import Foundation
 import Combine
 
-/// FLOService handles all HTTP communication with the FLO ESP32 hardware
-/// Base URL: http://192.168.4.1 (FLO WiFi AP)
-///
-/// Key endpoints:
-/// - GET /identity → truck name, firmware
-/// - GET /gps → position, satellites, speed
-/// - GET /get_totals → gallons & chemical oz
-/// - GET /get_relay_status → "1,0,0" for 3 relays
-/// - GET /get_relay_names → custom relay names
-/// - POST /cmd?data=RELAY=1,on → toggle relay
-/// - POST /cmd?data=SWEEP_ENABLE → enable sweep
-/// - GET /daylog/list → list CSV files for sync
-/// - GET /daylog/download?name=X.csv → download specific file
 class FLOService: ObservableObject {
     static let shared = FLOService()
     
     private let baseURL = "http://192.168.4.1"
     private let session: URLSession
     private var pollTimer: Timer?
+    
+    /// Tracks whether polling has been started (so resumePolling knows to restart)
+    private var pollingWasActive: Bool = false
+    
+    /// Consecutive identity check failures — used to back off when not on FLO WiFi
+    private var identityFailCount: Int = 0
     
     // MARK: - Published State
     @Published var isConnected = false
@@ -58,39 +72,111 @@ class FLOService: ObservableObject {
         session = URLSession(configuration: config)
     }
     
-    // MARK: - Connection
+    // MARK: - Connection / Polling
+    
+    /// Start polling for FLO data.
+    /// Called by FLOControlView.onAppear — now network-aware.
     func startPolling() {
         stopPolling()
+        pollingWasActive = true
+        identityFailCount = 0
         
         // Initial fetch
-        Task { await checkConnection() }
-        
-        // Poll every 5 seconds (not 2) - only poll live data if connected
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            Task { await self?.pollIfConnected() }
+        Task { @MainActor in
+            await checkConnection()
         }
+        
+        // Poll on a timer — the callback checks network state before each request
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                await self?.networkAwarePoll()
+            }
+        }
+        
+        print("[FLOService] Polling started")
     }
     
+    /// Stop polling completely. Timer is invalidated.
     func stopPolling() {
         pollTimer?.invalidate()
         pollTimer = nil
+        pollingWasActive = false
+        print("[FLOService] Polling stopped")
+    }
+    
+    /// Pause polling (app going to background). Remembers that polling was active.
+    func pausePolling() {
+        guard pollTimer != nil else { return }
+        pollTimer?.invalidate()
+        pollTimer = nil
+        // pollingWasActive stays true so resumePolling can restart
+        print("[FLOService] Polling paused (background)")
+    }
+    
+    /// Resume polling (app coming to foreground). Only restarts if it was active before.
+    func resumePolling() {
+        guard pollingWasActive && pollTimer == nil else { return }
+        identityFailCount = 0
+        
+        // Re-check connection immediately
+        Task { @MainActor in
+            await checkConnection()
+        }
+        
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                await self?.networkAwarePoll()
+            }
+        }
+        
+        print("[FLOService] Polling resumed (foreground)")
+    }
+    
+    /// Network-aware poll — checks NetworkMonitor before making requests.
+    /// When not on WiFi, skips entirely (FLO is always WiFi AP).
+    /// When on WiFi but FLO not connected, backs off identity checks.
+    @MainActor
+    private func networkAwarePoll() async {
+        let network = NetworkMonitor.shared
+        
+        // FLO is a WiFi AP — if we're not on WiFi at all, skip everything
+        if network.connectionType != .wifi {
+            if isConnected {
+                isConnected = false
+                network.setFLOWiFiConnected(false)
+                print("[FLOService] Not on WiFi — marking disconnected")
+            }
+            return
+        }
+        
+        // We're on WiFi — poll normally
+        if isConnected {
+            await pollLiveData()
+        } else {
+            // Not connected yet — try identity, but back off after repeated failures
+            // to avoid hammering the network stack during WiFi transitions
+            identityFailCount += 1
+            
+            // Back off: check every 5s for first 3 attempts, then every 15s, then every 30s
+            let shouldCheck: Bool
+            if identityFailCount <= 3 {
+                shouldCheck = true
+            } else if identityFailCount <= 10 {
+                shouldCheck = identityFailCount % 3 == 0  // every 15s
+            } else {
+                shouldCheck = identityFailCount % 6 == 0  // every 30s
+            }
+            
+            if shouldCheck {
+                await fetchIdentity()
+            }
+        }
     }
     
     /// Check if FLO is reachable
     @MainActor
     private func checkConnection() async {
         await fetchIdentity()
-    }
-    
-    /// Only poll if we're connected - don't spam when offline
-    @MainActor
-    private func pollIfConnected() async {
-        if isConnected {
-            await pollLiveData()
-        } else {
-            // Just check identity occasionally when disconnected
-            await fetchIdentity()
-        }
     }
     
     /// Refresh all data from FLO
@@ -121,10 +207,27 @@ class FLOService: ObservableObject {
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 truckName = json["ssid"] as? String ?? ""
                 firmwareVersion = json["version"] as? String ?? ""
+                
+                let wasConnected = isConnected
                 isConnected = true
+                identityFailCount = 0
+                
+                // Tell NetworkMonitor we confirmed FLO WiFi
+                NetworkMonitor.shared.setFLOWiFiConnected(true)
+                
+                if !wasConnected {
+                    print("[FLOService] ✓ Connected to FLO: \(truckName) (fw: \(firmwareVersion))")
+                    // Fetch relay info on first connect
+                    await fetchRelayStatus()
+                    await fetchRelayNames()
+                }
             }
         } catch {
+            if isConnected {
+                print("[FLOService] Lost connection to FLO")
+            }
             isConnected = false
+            NetworkMonitor.shared.setFLOWiFiConnected(false)
         }
     }
     

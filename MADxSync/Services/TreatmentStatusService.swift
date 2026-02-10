@@ -202,7 +202,8 @@ class TreatmentStatusService: ObservableObject {
         isLoading = true
         lastError = nil
         
-        guard let url = URL(string: "\(supabaseURL)/rest/v1/treatment_status?select=*") else {
+        guard let districtId = AuthService.shared.districtId,
+              let url = URL(string: "\(supabaseURL)/rest/v1/treatment_status?district_id=eq.\(districtId)&select=*") else {
             lastError = "Invalid URL"
             isLoading = false
             return
@@ -212,6 +213,10 @@ class TreatmentStatusService: ObservableObject {
         request.timeoutInterval = 30
         request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if let token = AuthService.shared.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -313,6 +318,10 @@ class TreatmentStatusService: ObservableObject {
         request.timeoutInterval = 15
         request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if let token = AuthService.shared.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         request.setValue("return=minimal", forHTTPHeaderField: "Prefer")
         
         do {
