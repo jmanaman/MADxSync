@@ -12,6 +12,8 @@
 //  UPDATED: 2026-02-09 — Added lifecycle management (scenePhase),
 //  network monitor integration, and foreground/background handling.
 //
+//  UPDATED: 2026-02-11 — Banner logic for FLO WiFi + LTE coexistence.
+//
 
 import SwiftUI
 import UIKit
@@ -105,40 +107,49 @@ struct RootView: View {
     @EnvironmentObject var truckService: TruckService
     @EnvironmentObject var networkMonitor: NetworkMonitor
     
+    /// Whether any network banner is currently showing
+    private var bannerShowing: Bool {
+        if !networkMonitor.isConnected && !networkMonitor.wifiAvailable { return true }
+        if networkMonitor.isFLOWiFi { return true }
+        return false
+    }
+    
     var body: some View {
-        ZStack {
+        VStack(spacing: 0) {
+            // Network status banner — sits ABOVE content so it never covers the FLO toolbar
+            if !networkMonitor.isConnected && !networkMonitor.wifiAvailable {
+                offlineBanner
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            } else if networkMonitor.isFLOWiFi && networkMonitor.connectionType == .cellular {
+                // Best state: FLO WiFi for hardware control + LTE for cloud sync
+                floLTEBanner
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            } else if networkMonitor.isFLOWiFi {
+                // FLO WiFi only, no LTE
+                floWiFiBanner
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            
+            // Main content fills remaining space
             Group {
                 if !authService.isAuthenticated {
-                    // Step 1: Login
                     LoginView()
                 } else if !truckService.hasTruckSelected {
-                    // Step 2: Pick a truck
                     TruckPickerView()
                 } else {
-                    // Step 3: Go
                     MainTabView()
                 }
             }
+            .frame(maxHeight: .infinity)
             .animation(.easeInOut, value: authService.isAuthenticated)
             .animation(.easeInOut, value: truckService.hasTruckSelected)
-            
-            // Offline banner — always visible regardless of auth state
-            VStack {
-                if !networkMonitor.hasInternet && !networkMonitor.isFLOWiFi {
-                    offlineBanner
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                } else if networkMonitor.isFLOWiFi {
-                    floWiFiBanner
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-                Spacer()
-            }
-            .animation(.easeInOut(duration: 0.3), value: networkMonitor.hasInternet)
-            .animation(.easeInOut(duration: 0.3), value: networkMonitor.isFLOWiFi)
         }
+        .animation(.easeInOut(duration: 0.3), value: networkMonitor.hasInternet)
+        .animation(.easeInOut(duration: 0.3), value: networkMonitor.isFLOWiFi)
+        .animation(.easeInOut(duration: 0.3), value: networkMonitor.wifiAvailable)
     }
     
-    // MARK: - Offline Banner
+    // MARK: - Banners
     
     private var offlineBanner: some View {
         HStack(spacing: 8) {
@@ -166,6 +177,20 @@ struct RootView: View {
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity)
         .background(Color.orange.opacity(0.9))
+    }
+    
+    private var floLTEBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .font(.caption.bold())
+            Text("FLO WiFi + LTE")
+                .font(.caption.bold())
+        }
+        .foregroundColor(.white)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(Color.green.opacity(0.85))
     }
 }
 

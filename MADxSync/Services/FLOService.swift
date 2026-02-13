@@ -8,6 +8,13 @@
 //  HARDENED: 2026-02-09 — Network-aware polling, pause/resume for lifecycle,
 //  FLO WiFi detection via NetworkMonitor, no polling when not on FLO WiFi.
 //
+//  UPDATED: 2026-02-11 — WiFi-pinned URLSession for LTE coexistence.
+//  When iOS enables LTE alongside FLO WiFi (because FLO has no internet),
+//  the default URLSession routes requests over LTE, which can't reach 192.168.4.1.
+//  Fix: Create a URLSession bound to the WiFi interface so FLO requests always
+//  go over WiFi regardless of iOS routing preferences. This lets flow estimate
+//  polling continue working while LTE handles cloud sync in the background.
+//
 //  Key endpoints:
 //  - GET /identity → truck name, firmware
 //  - GET /gps → position, satellites, speed
@@ -21,12 +28,46 @@
 
 import Foundation
 import Combine
+import Network
 
 class FLOService: ObservableObject {
     static let shared = FLOService()
     
     private let baseURL = "http://192.168.4.1"
-    private let session: URLSession
+    
+    // MARK: - WiFi-Pinned URLSession
+    //
+    // WHY: When iOS detects that FLO WiFi has no internet connectivity, it may
+    // offer to enable LTE for data. Once LTE is active, iOS promotes it as the
+    // preferred route. The default URLSession then routes ALL requests over LTE —
+    // including our requests to 192.168.4.1, which is only reachable over WiFi.
+    //
+    // FIX: We create a URLSession whose underlying connection is bound to the
+    // WiFi interface using URLSessionConfiguration + a custom URLProtocol, or
+    // more practically, by using Network.framework's NWConnection with
+    // requiredInterfaceType(.wifi).
+    //
+    // However, URLSession doesn't natively support requiredInterfaceType.
+    // The cleanest iOS approach is:
+    //   1. Use a URLSessionConfiguration with waitsForConnectivity = false
+    //   2. Set allowsCellularAccess = false — this forces WiFi
+    //   3. Set allowsExpensiveNetworkAccess = false (belts + suspenders)
+    //
+    // allowsCellularAccess = false is the key. It tells URLSession:
+    // "Do NOT use cellular for this request, even if cellular is available."
+    // Since the only non-cellular interface is WiFi, this pins to WiFi.
+    //
+    // This is the Apple-recommended approach and is used by many IoT apps
+    // that communicate with local WiFi devices (printers, smart home, etc).
+    
+    /// WiFi-only session for all FLO communication.
+    /// Requests will NEVER route over cellular, ensuring they reach 192.168.4.1.
+    private let wifiSession: URLSession
+    
+    /// Fallback session (allows cellular) — used ONLY for non-FLO requests if needed.
+    /// Currently unused, but available if we add cloud-side FLO features later.
+    private let defaultSession: URLSession
+    
     private var pollTimer: Timer?
     
     /// Tracks whether polling has been started (so resumePolling knows to restart)
@@ -64,12 +105,44 @@ class FLOService: ObservableObject {
     // Sweep
     @Published var sweepEnabled = false
     
+    // Cycle logs — authoritative per-spray data from FlowTracker on the ESP32.
+    // Format per entry: "cycleNumber,durationMs,gallons,oz"
+    // These are calculated at the EXACT moment the relay toggles, not from polled snapshots.
+    @Published var cycleLogs: [CycleLog] = []
+    
+    struct CycleLog: Identifiable {
+        let id: Int          // cycle number
+        let durationMs: UInt32
+        let gallons: Double
+        let chemicalOz: Double
+        
+        var durationString: String {
+            let totalSeconds = Int(durationMs / 1000)
+            let mins = totalSeconds / 60
+            let secs = totalSeconds % 60
+            return "\(mins)m \(secs)s"
+        }
+    }
+    
     // MARK: - Init
     private init() {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 3
-        config.timeoutIntervalForResource = 5
-        session = URLSession(configuration: config)
+        // WiFi-pinned session — the critical fix for LTE coexistence
+        let wifiConfig = URLSessionConfiguration.default
+        wifiConfig.timeoutIntervalForRequest = 3
+        wifiConfig.timeoutIntervalForResource = 5
+        wifiConfig.allowsCellularAccess = false          // ← KEY: Forces WiFi-only
+        wifiConfig.allowsExpensiveNetworkAccess = false   // ← Belt + suspenders (cellular is "expensive")
+        wifiConfig.allowsConstrainedNetworkAccess = true  // Allow on Low Data Mode (WiFi is fine)
+        wifiConfig.waitsForConnectivity = false           // Fail fast if WiFi unavailable, don't wait
+        wifiSession = URLSession(configuration: wifiConfig)
+        
+        // Default session for anything that should use the best available path
+        let defaultConfig = URLSessionConfiguration.default
+        defaultConfig.timeoutIntervalForRequest = 3
+        defaultConfig.timeoutIntervalForResource = 5
+        defaultSession = URLSession(configuration: defaultConfig)
+        
+        print("[FLOService] Initialized with WiFi-pinned session (allowsCellularAccess=false)")
     }
     
     // MARK: - Connection / Polling
@@ -133,23 +206,35 @@ class FLOService: ObservableObject {
     }
     
     /// Network-aware poll — checks NetworkMonitor before making requests.
-    /// When not on WiFi, skips entirely (FLO is always WiFi AP).
-    /// When on WiFi but FLO not connected, backs off identity checks.
+    ///
+    /// UPDATED 2026-02-11: Changed guard from `connectionType != .wifi` to
+    /// `!wifiAvailable`. This is critical for LTE coexistence.
+    ///
+    /// OLD behavior: If iOS reported cellular as the primary path, we'd bail.
+    ///   This killed flow estimates when LTE was enabled alongside FLO WiFi.
+    ///
+    /// NEW behavior: We check if WiFi is available AT ALL (even if not primary).
+    ///   Combined with the WiFi-pinned URLSession, requests reach 192.168.4.1
+    ///   even when LTE is the "preferred" route for internet traffic.
     @MainActor
     private func networkAwarePoll() async {
         let network = NetworkMonitor.shared
         
-        // FLO is a WiFi AP — if we're not on WiFi at all, skip everything
-        if network.connectionType != .wifi {
+        // FLO is a WiFi AP — if WiFi interface is not available at all, skip everything.
+        // NOTE: We check wifiAvailable, NOT connectionType == .wifi.
+        // When iOS enables LTE alongside FLO WiFi, connectionType may report .cellular
+        // even though WiFi is still associated. wifiAvailable checks the actual interface.
+        if !network.wifiAvailable {
             if isConnected {
                 isConnected = false
                 network.setFLOWiFiConnected(false)
-                print("[FLOService] Not on WiFi — marking disconnected")
+                print("[FLOService] WiFi interface not available — marking disconnected")
             }
             return
         }
         
-        // We're on WiFi — poll normally
+        // WiFi is available — poll normally using the WiFi-pinned session.
+        // Even if LTE is active, our wifiSession will route to 192.168.4.1 over WiFi.
         if isConnected {
             await pollLiveData()
         } else {
@@ -190,11 +275,12 @@ class FLOService: ObservableObject {
         }
     }
     
-    /// Poll frequently changing data (GPS, totals)
+    /// Poll frequently changing data (GPS, totals, cycle logs)
     @MainActor
     func pollLiveData() async {
         await fetchGPS()
         await fetchTotals()
+        await fetchCycleLogs()
     }
     
     // MARK: - Identity
@@ -203,7 +289,7 @@ class FLOService: ObservableObject {
         guard let url = URL(string: "\(baseURL)/identity") else { return }
         
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await wifiSession.data(from: url)
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 truckName = json["ssid"] as? String ?? ""
                 firmwareVersion = json["version"] as? String ?? ""
@@ -224,7 +310,7 @@ class FLOService: ObservableObject {
             }
         } catch {
             if isConnected {
-                print("[FLOService] Lost connection to FLO")
+                print("[FLOService] Lost connection to FLO: \(error.localizedDescription)")
             }
             isConnected = false
             NetworkMonitor.shared.setFLOWiFiConnected(false)
@@ -237,7 +323,7 @@ class FLOService: ObservableObject {
         guard let url = URL(string: "\(baseURL)/gps") else { return }
         
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await wifiSession.data(from: url)
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 gpsFix = json["fix"] as? Bool ?? false
                 gpsSatellites = json["sats"] as? Int ?? 0
@@ -262,7 +348,7 @@ class FLOService: ObservableObject {
         guard let url = URL(string: "\(baseURL)/get_totals") else { return }
         
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await wifiSession.data(from: url)
             if let text = String(data: data, encoding: .utf8) {
                 // Format: "gallons=2.45&chemical=6.27"
                 let parts = text.split(separator: "&")
@@ -282,13 +368,59 @@ class FLOService: ObservableObject {
         }
     }
     
+    // MARK: - Cycle Logs (authoritative per-spray data from FlowTracker)
+    //
+    // The FLO's FlowTracker calculates per-cycle gallons and chemical at the
+    // EXACT moment the relay toggles on/off. These are the ground truth numbers.
+    // The app should NEVER calculate its own per-spray deltas from polled totals
+    // because polling introduces a 5+ second lag that consistently undercounts.
+    //
+    // Endpoint: GET /get_logs
+    // Format: "cycleNumber,durationMs,gallons,oz\n..." (last 10 cycles, newest last)
+    
+    @MainActor
+    func fetchCycleLogs() async {
+        guard let url = URL(string: "\(baseURL)/get_logs") else { return }
+        
+        do {
+            let (data, _) = try await wifiSession.data(from: url)
+            if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
+                guard !text.isEmpty else { return }
+                
+                var logs: [CycleLog] = []
+                let lines = text.split(separator: "\n")
+                for line in lines {
+                    let parts = line.split(separator: ",")
+                    if parts.count >= 4 {
+                        let cycleNum = Int(parts[0]) ?? 0
+                        let durMs = UInt32(parts[1]) ?? 0
+                        let gal = Double(parts[2]) ?? 0
+                        let oz = Double(parts[3]) ?? 0
+                        logs.append(CycleLog(
+                            id: cycleNum,
+                            durationMs: durMs,
+                            gallons: gal,
+                            chemicalOz: oz
+                        ))
+                    }
+                }
+                
+                // FlowTracker stores oldest-first, reverse for display (newest first)
+                cycleLogs = logs.reversed()
+                isConnected = true
+            }
+        } catch {
+            // Cycle logs fetch failed — non-critical
+        }
+    }
+    
     // MARK: - Relay Status
     @MainActor
     func fetchRelayStatus() async {
         guard let url = URL(string: "\(baseURL)/get_relay_status") else { return }
         
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await wifiSession.data(from: url)
             if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
                 // Format: "1,0,0"
                 let parts = text.split(separator: ",")
@@ -309,7 +441,7 @@ class FLOService: ObservableObject {
         guard let url = URL(string: "\(baseURL)/get_relay_names") else { return }
         
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await wifiSession.data(from: url)
             if let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) {
                 // Format: "BTI,Oil,Pump"
                 let parts = text.split(separator: ",")
@@ -386,7 +518,7 @@ class FLOService: ObservableObject {
         }
         
         do {
-            let (_, response) = try await session.data(from: url)
+            let (_, response) = try await wifiSession.data(from: url)
             if let httpResponse = response as? HTTPURLResponse {
                 return httpResponse.statusCode == 200
             }
@@ -409,7 +541,7 @@ class FLOService: ObservableObject {
         guard let url = URL(string: "\(baseURL)/daylog/list") else { return [] }
         
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await wifiSession.data(from: url)
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let files = json["files"] as? [[String: Any]] {
                 return files.compactMap { file in
@@ -433,7 +565,7 @@ class FLOService: ObservableObject {
         }
         
         do {
-            let (data, _) = try await session.data(from: url)
+            let (data, _) = try await wifiSession.data(from: url)
             return String(data: data, encoding: .utf8)
         } catch {
             print("Daylog download failed: \(error)")
@@ -448,7 +580,7 @@ class FLOService: ObservableObject {
         request.httpMethod = "POST"
         
         do {
-            let (_, response) = try await session.data(for: request)
+            let (_, response) = try await wifiSession.data(for: request)
             if let httpResponse = response as? HTTPURLResponse {
                 return httpResponse.statusCode == 200
             }
@@ -468,7 +600,7 @@ class FLOService: ObservableObject {
         
         do {
             request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-            let (_, response) = try await session.data(for: request)
+            let (_, response) = try await wifiSession.data(for: request)
             if let httpResponse = response as? HTTPURLResponse {
                 return httpResponse.statusCode == 200
             }

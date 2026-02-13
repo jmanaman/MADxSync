@@ -1,47 +1,14 @@
 import SwiftUI
 
-/// Spray session tracking
-struct SpraySession: Identifiable {
-    let id = UUID()
-    let startTime: Date
-    var endTime: Date?
-    var startGallons: Double
-    var startChemical: Double
-    var endGallons: Double?
-    var endChemical: Double?
-    
-    var gallonsUsed: Double {
-        guard let end = endGallons else { return 0 }
-        return end - startGallons
-    }
-    
-    var chemicalUsed: Double {
-        guard let end = endChemical else { return 0 }
-        return end - startChemical
-    }
-    
-    var duration: TimeInterval {
-        (endTime ?? Date()).timeIntervalSince(startTime)
-    }
-    
-    var durationString: String {
-        let seconds = Int(duration)
-        let mins = seconds / 60
-        let secs = seconds % 60
-        return "\(mins)m \(secs)s"
-    }
-}
-
-/// Collapsible spray control panel with session tracking
+/// Collapsible spray control panel with session tracking.
+///
+/// UPDATED 2026-02-11: "Recent Sprays" now shows authoritative per-cycle data
+/// from FlowTracker on the ESP32 (via GET /get_logs), NOT locally calculated
+/// deltas from polled totals. The FLO calculates per-cycle gallons/chemical at
+/// the exact moment the relay toggles, so the numbers match the FLO UI exactly.
 struct FLOControlView: View {
     @ObservedObject var floService = FLOService.shared
     @State private var isExpanded = false
-    
-    // Spray session tracking
-    @State private var activeSession: SpraySession?
-    @State private var completedSessions: [SpraySession] = []
-    @State private var sessionGallons: Double = 0
-    @State private var sessionChemical: Double = 0
     
     var body: some View {
         VStack(spacing: 0) {
@@ -58,36 +25,6 @@ struct FLOControlView: View {
         .shadow(color: .black.opacity(0.15), radius: 4, y: 2)
         .onAppear {
             floService.startPolling()
-        }
-        .onChange(of: floService.relay1On) { _, isOn in
-            handleBTIStateChange(isOn: isOn)
-        }
-    }
-    
-    // MARK: - BTI State Change (auto session tracking)
-    private func handleBTIStateChange(isOn: Bool) {
-        if isOn && activeSession == nil {
-            // BTI turned ON - start session
-            activeSession = SpraySession(
-                startTime: Date(),
-                startGallons: floService.gallons,
-                startChemical: floService.chemicalOz
-            )
-            sessionGallons = 0
-            sessionChemical = 0
-        } else if !isOn && activeSession != nil {
-            // BTI turned OFF - end session
-            var session = activeSession!
-            session.endTime = Date()
-            session.endGallons = floService.gallons
-            session.endChemical = floService.chemicalOz
-            
-            completedSessions.insert(session, at: 0)
-            if completedSessions.count > 10 {
-                completedSessions.removeLast()
-            }
-            
-            activeSession = nil
         }
     }
     
@@ -114,19 +51,10 @@ struct FLOControlView: View {
                         }
                     }
                     
-                    // Session totals (current spray)
-                    if activeSession != nil {
-                        Text(String(format: "%.2f gal • %.2f oz",
-                            floService.gallons - (activeSession?.startGallons ?? 0),
-                            floService.chemicalOz - (activeSession?.startChemical ?? 0)))
-                            .font(.caption.monospacedDigit())
-                            .foregroundColor(.primary)
-                    } else {
-                        // Cumulative totals
-                        Text(String(format: "%.2f gal • %.2f oz", floService.gallons, floService.chemicalOz))
-                            .font(.caption.monospacedDigit())
-                            .foregroundColor(.secondary)
-                    }
+                    // Cumulative totals from FlowTracker
+                    Text(String(format: "%.2f gal • %.2f oz", floService.gallons, floService.chemicalOz))
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(floService.relay1On ? .primary : .secondary)
                 } else {
                     Text("FLO Offline")
                         .font(.caption)
@@ -226,8 +154,8 @@ struct FLOControlView: View {
                 }
             }
             
-            // Last sprays log (if any)
-            if !completedSessions.isEmpty {
+            // Recent Sprays — authoritative data from FlowTracker
+            if !floService.cycleLogs.isEmpty {
                 Divider()
                 
                 VStack(alignment: .leading, spacing: 4) {
@@ -235,16 +163,16 @@ struct FLOControlView: View {
                         .font(.caption.bold())
                         .foregroundColor(.secondary)
                     
-                    ForEach(completedSessions.prefix(5)) { session in
+                    ForEach(floService.cycleLogs.prefix(5)) { cycle in
                         HStack {
-                            Text(session.durationString)
+                            Text(cycle.durationString)
                                 .font(.caption.monospacedDigit())
                             Spacer()
-                            Text(String(format: "%.2f gal", session.gallonsUsed))
+                            Text(String(format: "%.2f gal", cycle.gallons))
                                 .font(.caption.monospacedDigit())
                             Text("•")
                                 .foregroundColor(.secondary)
-                            Text(String(format: "%.2f oz", session.chemicalUsed))
+                            Text(String(format: "%.2f oz", cycle.chemicalOz))
                                 .font(.caption.monospacedDigit())
                         }
                         .foregroundColor(.secondary)

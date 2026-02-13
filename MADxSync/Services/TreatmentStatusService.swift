@@ -75,6 +75,18 @@ class TreatmentStatusService: ObservableObject {
     private let cacheKeyOverrides = "treatment_local_overrides"
     private let cacheKeyLastSync = "treatment_last_sync"
     private let cacheDir: URL
+    
+    // MARK: - Pending Cycle Updates (offline queue)
+    
+    /// Queued cycle updates waiting for network
+    private var pendingCycleUpdates: [PendingCycleUpdate] = []
+    
+    struct PendingCycleUpdate: Codable {
+        let featureId: String
+        let featureType: String
+        let cycleDays: Int
+        let queuedAt: Date
+    }
 
     // MARK: - Init
 
@@ -84,6 +96,7 @@ class TreatmentStatusService: ObservableObject {
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         migrateFromUserDefaults()
         loadFromCache()
+        loadPendingCycleUpdates()
     }
     
     // MARK: - Get Effective Color for a Feature
@@ -286,6 +299,9 @@ class TreatmentStatusService: ObservableObject {
             
             print("[TreatmentStatus] Synced \(statuses.count) feature statuses from Hub (v\(statusVersion))")
             
+            // Push any pending cycle updates after successful sync
+            await pushPendingCycleUpdates()
+            
         } catch {
             lastError = error.localizedDescription
             print("[HubTreatmentStatus] Sync error: \(error)")
@@ -449,6 +465,236 @@ class TreatmentStatusService: ObservableObject {
         }
         
         print("[HubTreatmentStatus] Loaded from cache: \(statusByFeature.count) statuses, \(localOverrides.count) local overrides")
+    }
+    
+    // MARK: - Cycle Days Update (Push-Off)
+
+    /// Update the treatment cycle for a source.
+    /// Writes to source_notes table (same table Hub reads).
+    /// Optimistically updates local cache so map colors change immediately.
+    func updateCycleDays(
+        featureId: String,
+        featureType: String,
+        cycleDays: Int
+    ) async -> Bool {
+        // 1. Optimistic local update — map color changes immediately
+        if var status = statusByFeature[featureId] {
+            // Rebuild the status with new cycle_days
+            let updated = HubTreatmentStatus(
+                id: status.id,
+                feature_id: status.feature_id,
+                feature_type: status.feature_type,
+                color: recalculateColor(daysSince: status.days_since, cycleDays: cycleDays),
+                days_since: status.days_since,
+                last_treated: status.last_treated,
+                last_treated_by: status.last_treated_by,
+                last_chemical: status.last_chemical,
+                cycle_days: cycleDays,
+                status_text: recalculateStatusText(daysSince: status.days_since, cycleDays: cycleDays),
+                updated_at: ISO8601DateFormatter().string(from: Date())
+            )
+            statusByFeature[featureId] = updated
+        } else {
+            // Source has never been treated — only set the cycle, don't fake an observation.
+            // Source stays red (Never Treated) until a real treatment/observed marker is dropped.
+            // The cycle will activate once the first real treatment is logged.
+            let newStatus = HubTreatmentStatus(
+                id: nil,
+                feature_id: featureId,
+                feature_type: featureType,
+                color: TreatmentColors.never,
+                days_since: nil,
+                last_treated: nil,
+                last_treated_by: nil,
+                last_chemical: nil,
+                cycle_days: cycleDays,
+                status_text: "Never Treated",
+                updated_at: ISO8601DateFormatter().string(from: Date())
+            )
+            statusByFeature[featureId] = newStatus
+        }
+        
+        statusVersion += 1  // Trigger map overlay rebuild
+        saveToCache()
+        
+        print("[TreatmentStatus] Cycle updated: \(featureId) → \(cycleDays) days (v\(statusVersion))")
+        
+        // 2. Write to source_notes in Supabase (same table Hub reads)
+        guard NetworkMonitor.shared.hasInternet else {
+            print("[TreatmentStatus] Cycle update queued — no internet, saved locally")
+            // Queue for later sync
+            queueCycleUpdate(featureId: featureId, featureType: featureType, cycleDays: cycleDays)
+            return true  // Local update succeeded
+        }
+        
+        let success = await writeCycleDaysToSupabase(
+            featureId: featureId,
+            featureType: featureType,
+            cycleDays: cycleDays
+        )
+        
+        if !success {
+            // Network write failed — queue for retry
+            queueCycleUpdate(featureId: featureId, featureType: featureType, cycleDays: cycleDays)
+            print("[TreatmentStatus] Supabase write failed — queued for retry")
+        }
+        
+        return true  // Local update always succeeds
+    }
+
+    /// Write cycle days to source_notes table in Supabase.
+    /// This is the same table the Hub reads via SourceNotes.getPushOffDays().
+    private func writeCycleDaysToSupabase(
+        featureId: String,
+        featureType: String,
+        cycleDays: Int
+    ) async -> Bool {
+        guard let districtId = AuthService.shared.districtId else { return false }
+        
+        // Map iOS feature types to Hub source_notes types
+        let sourceType = mapFeatureTypeToSourceType(featureType)
+        
+        guard let url = URL(string: "\(supabaseURL)/rest/v1/source_notes") else { return false }
+        
+        let payload: [String: Any] = [
+            "district_id": districtId,
+            "source_type": sourceType,
+            "source_id": featureId,
+            "push_off_days": cycleDays,
+            "created_by": "app"
+        ]
+        
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return false }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.timeoutInterval = 15
+        request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Upsert: update if exists, insert if new
+        request.setValue("resolution=merge-duplicates", forHTTPHeaderField: "Prefer")
+        
+        if let token = AuthService.shared.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse {
+                let success = httpResponse.statusCode == 200 || httpResponse.statusCode == 201
+                if success {
+                    print("[TreatmentStatus] ✓ Wrote cycle_days=\(cycleDays) for \(featureId) to source_notes")
+                }
+                return success
+            }
+            return false
+        } catch {
+            print("[TreatmentStatus] source_notes write error: \(error)")
+            return false
+        }
+    }
+
+    /// Map iOS feature_type strings to Hub source_notes source_type strings
+    private func mapFeatureTypeToSourceType(_ featureType: String) -> String {
+        switch featureType.lowercased() {
+        case "field": return "polygon"
+        case "polyline": return "polyline"
+        case "pointsite": return "pointsite"
+        case "stormdrain": return "pointsite"  // Storm drains use pointsite in source_notes
+        default: return featureType
+        }
+    }
+
+    // MARK: - Proportional Color Calculation (matches Hub)
+
+    /// Recalculate color using proportional thresholds — MUST match Hub's Utils.getTreatmentColor
+    private func recalculateColor(daysSince: Int?, cycleDays: Int) -> String {
+        guard let days = daysSince else { return TreatmentColors.never }
+        
+        let cycle = max(cycleDays, 1)
+        let greenEnd = Int(Double(cycle) * 0.60)
+        let yellowEnd = Int(Double(cycle) * 0.80)
+        
+        if days <= greenEnd { return TreatmentColors.fresh }
+        if days <= yellowEnd { return TreatmentColors.recent }
+        if days <= cycle { return TreatmentColors.aging }
+        return TreatmentColors.overdue
+    }
+
+    /// Recalculate status text — MUST match Hub's Utils.getTreatmentStatus
+    private func recalculateStatusText(daysSince: Int?, cycleDays: Int) -> String {
+        guard let days = daysSince else { return "Never Treated" }
+        
+        let cycle = max(cycleDays, 1)
+        let greenEnd = Int(Double(cycle) * 0.60)
+        let yellowEnd = Int(Double(cycle) * 0.80)
+        let daysUntilDue = max(0, cycle - days)
+        
+        if days <= 1 { return "Just Treated" }
+        if days <= greenEnd { return "\(days) days ago" }
+        if days <= yellowEnd { return "\(days) days ago (due in \(daysUntilDue)d)" }
+        if days <= cycle { return "\(days) days ago (due in \(daysUntilDue)d)" }
+        let overdue = days - cycle
+        return "OVERDUE by \(overdue)d (\(days)d ago)"
+    }
+
+    private func queueCycleUpdate(featureId: String, featureType: String, cycleDays: Int) {
+        // Remove any existing pending update for this feature
+        pendingCycleUpdates.removeAll { $0.featureId == featureId }
+        
+        pendingCycleUpdates.append(PendingCycleUpdate(
+            featureId: featureId,
+            featureType: featureType,
+            cycleDays: cycleDays,
+            queuedAt: Date()
+        ))
+        
+        savePendingCycleUpdates()
+    }
+
+    /// Push any pending cycle updates to Supabase. Call this when network comes back.
+    func pushPendingCycleUpdates() async {
+        guard NetworkMonitor.shared.hasInternet else { return }
+        guard !pendingCycleUpdates.isEmpty else { return }
+        
+        var remaining: [PendingCycleUpdate] = []
+        
+        for update in pendingCycleUpdates {
+            let success = await writeCycleDaysToSupabase(
+                featureId: update.featureId,
+                featureType: update.featureType,
+                cycleDays: update.cycleDays
+            )
+            if !success {
+                remaining.append(update)
+            }
+        }
+        
+        pendingCycleUpdates = remaining
+        savePendingCycleUpdates()
+        
+        if remaining.isEmpty {
+            print("[TreatmentStatus] ✓ All pending cycle updates pushed")
+        } else {
+            print("[TreatmentStatus] \(remaining.count) cycle updates still pending")
+        }
+    }
+
+    private func savePendingCycleUpdates() {
+        if let data = try? JSONEncoder().encode(pendingCycleUpdates) {
+            try? data.write(to: cacheDir.appendingPathComponent("pending_cycle_updates.json"), options: .atomic)
+        }
+    }
+
+    private func loadPendingCycleUpdates() {
+        if let data = try? Data(contentsOf: cacheDir.appendingPathComponent("pending_cycle_updates.json")),
+           let updates = try? JSONDecoder().decode([PendingCycleUpdate].self, from: data) {
+            pendingCycleUpdates = updates
+            if !updates.isEmpty {
+                print("[TreatmentStatus] Loaded \(updates.count) pending cycle updates")
+            }
+        }
     }
 }
 

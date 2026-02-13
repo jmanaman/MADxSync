@@ -1293,14 +1293,53 @@ enum SelectedFeature {
     }
 }
 
+// ============================================
+// REPLACEMENT: FeatureInfoView
+// ============================================
+//
+// WHAT CHANGED:
+// Added CycleDayChips row in the Treatment Status section.
+// Tech taps a chip → cycle updates locally (map recolors immediately)
+// and writes to source_notes in Supabase (Hub picks it up next publish).
+//
+// The chips show: 7, 14, 21, 30, 60, 90, 120, 180, 360
+// Current cycle is highlighted. One tap to change.
+//
+// INSTALL: Replace entire FeatureInfoView in FieldMapView.swift
+// ============================================
+
 struct FeatureInfoView: View {
     let feature: SelectedFeature
     @ObservedObject var treatmentStatusService = TreatmentStatusService.shared
     @Environment(\.dismiss) var dismiss
+    @State private var showCycleConfirm = false
+    @State private var pendingCycleDays: Int = 7
+    
+    /// Feature identifiers extracted once
+    private var featureId: String {
+        switch feature {
+        case .field(let f): return f.id
+        case .polyline(let p): return p.id
+        case .pointSite(let s): return s.id
+        case .stormDrain(let d): return d.id
+        }
+    }
+    
+    private var featureType: String {
+        switch feature {
+        case .field: return "field"
+        case .polyline: return "polyline"
+        case .pointSite: return "pointsite"
+        case .stormDrain: return "stormdrain"
+        }
+    }
+    
     var body: some View {
         NavigationView {
             List {
                 treatmentStatusSection
+                cycleDaysSection
+                
                 switch feature {
                 case .field(let field): fieldInfo(field)
                 case .polyline(let line): polylineInfo(line)
@@ -1308,38 +1347,126 @@ struct FeatureInfoView: View {
                 case .stormDrain(let drain): stormDrainInfo(drain)
                 }
             }
-            .navigationTitle(feature.title).navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } } }
+            .navigationTitle(feature.title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .alert("Change Cycle?", isPresented: $showCycleConfirm) {
+                Button("Set to \(pendingCycleDays) days", role: .none) {
+                    applyCycleChange(pendingCycleDays)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This source will rotate green → yellow → orange → red over \(pendingCycleDays) days instead of \(treatmentStatusService.statusForFeature(featureId).cycleDays) days.")
+            }
         }
     }
+    
+    // MARK: - Treatment Status Section
+    
     @ViewBuilder private var treatmentStatusSection: some View {
-        let featureId: String = {
-            switch feature {
-            case .field(let f): return f.id; case .polyline(let p): return p.id
-            case .pointSite(let s): return s.id; case .stormDrain(let d): return d.id
-            }
-        }()
         let status = treatmentStatusService.statusForFeature(featureId)
+        
         Section("Treatment Status") {
             HStack {
-                Circle().fill(Color(hex: status.color)).frame(width: 16, height: 16)
-                Text(status.statusText).font(.headline).foregroundColor(statusTextColor(status.color))
-                if status.isLocalOverride { Spacer(); Text("⏳ pending sync").font(.caption).foregroundColor(.secondary) }
+                Circle()
+                    .fill(Color(hex: status.color))
+                    .frame(width: 16, height: 16)
+                Text(status.statusText)
+                    .font(.headline)
+                    .foregroundColor(statusTextColor(status.color))
+                if status.isLocalOverride {
+                    Spacer()
+                    Text("⏳ pending sync")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             }
-            if let daysSince = status.daysSince { infoRow("Days Since Treatment", "\(daysSince)") }
+            
+            if let daysSince = status.daysSince {
+                infoRow("Days Since Treatment", "\(daysSince)")
+            }
             infoRow("Last Treated", status.formattedLastTreated)
             if let by = status.lastTreatedBy { infoRow("Treated By", by) }
             if let chemical = status.lastChemical { infoRow("Chemical", chemical) }
             infoRow("Cycle", "\(status.cycleDays) days")
         }
     }
+    
+    // MARK: - Cycle Days Section (The Push-Off Tool)
+    
+    @ViewBuilder private var cycleDaysSection: some View {
+        let status = treatmentStatusService.statusForFeature(featureId)
+        let currentCycle = status.cycleDays
+        
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: "clock.arrow.2.circlepath")
+                        .foregroundColor(.blue)
+                    Text("Treatment Cycle")
+                        .font(.subheadline.bold())
+                    Spacer()
+                    Text("\(currentCycle)d")
+                        .font(.caption.monospacedDigit().bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.blue.opacity(0.15))
+                        .foregroundColor(.blue)
+                        .cornerRadius(6)
+                }
+                
+                // Chip row — wrapping layout for all presets
+                CycleDayChipRow(
+                    currentCycle: currentCycle,
+                    onSelect: { days in
+                        if days != currentCycle {
+                            pendingCycleDays = days
+                            showCycleConfirm = true
+                        }
+                    }
+                )
+            }
+            .padding(.vertical, 4)
+        } header: {
+            Text("Push Off")
+        } footer: {
+            Text("How often this source needs treatment. Colors rotate proportionally across the cycle.")
+                .font(.caption2)
+        }
+    }
+    
+    // MARK: - Apply Cycle Change
+    
+    private func applyCycleChange(_ days: Int) {
+        Task {
+            _ = await treatmentStatusService.updateCycleDays(
+                featureId: featureId,
+                featureType: featureType,
+                cycleDays: days
+            )
+            
+            // Haptic feedback
+            let impact = UIImpactFeedbackGenerator(style: .medium)
+            impact.impactOccurred()
+        }
+    }
+    
+    // MARK: - Existing Detail Sections (unchanged)
+    
     private func statusTextColor(_ hex: String) -> Color {
         switch hex {
-        case TreatmentColors.fresh: return .green; case TreatmentColors.recent: return .yellow
-        case TreatmentColors.aging: return .orange; case TreatmentColors.overdue, TreatmentColors.never: return .red
+        case TreatmentColors.fresh: return .green
+        case TreatmentColors.recent: return .yellow
+        case TreatmentColors.aging: return .orange
+        case TreatmentColors.overdue, TreatmentColors.never: return .red
         default: return .primary
         }
     }
+    
     @ViewBuilder private func fieldInfo(_ field: FieldPolygon) -> some View {
         Section("Identification") {
             if let name = field.name { infoRow("Name", name) }
@@ -1355,6 +1482,7 @@ struct FeatureInfoView: View {
             if let active = field.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
+    
     @ViewBuilder private func polylineInfo(_ line: SpatialPolyline) -> some View {
         Section("Identification") {
             if let name = line.name { infoRow("Name", name) }
@@ -1369,6 +1497,7 @@ struct FeatureInfoView: View {
             if let active = line.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
+    
     @ViewBuilder private func pointSiteInfo(_ site: PointSite) -> some View {
         Section("Identification") {
             if let name = site.name { infoRow("Name", name) }
@@ -1382,6 +1511,7 @@ struct FeatureInfoView: View {
             if let active = site.active { infoRow("Active", active ? "Yes" : "No") }
         }
     }
+    
     @ViewBuilder private func stormDrainInfo(_ drain: StormDrain) -> some View {
         Section("Identification") {
             if let name = drain.name { infoRow("Name", name) }
@@ -1393,9 +1523,92 @@ struct FeatureInfoView: View {
             if let symbology = drain.symbology { infoRow("Status", symbology) }
         }
     }
+    
     private func infoRow(_ label: String, _ value: String) -> some View {
-        HStack { Text(label).foregroundColor(.secondary); Spacer(); Text(value) }
+        HStack {
+            Text(label).foregroundColor(.secondary)
+            Spacer()
+            Text(value)
+        }
     }
 }
 
+// MARK: - Cycle Day Chip Row
+
+struct CycleDayChipRow: View {
+    let currentCycle: Int
+    let onSelect: (Int) -> Void
+    
+    // Preset values — covers all practical scenarios
+    private let presets = [7, 14, 21, 30, 60, 90, 120, 180, 360]
+    
+    var body: some View {
+        // Two rows of chips for easy tapping with gloves
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                ForEach(presets.prefix(5), id: \.self) { days in
+                    CycleDayChip(
+                        days: days,
+                        isSelected: currentCycle == days,
+                        onTap: { onSelect(days) }
+                    )
+                }
+            }
+            HStack(spacing: 6) {
+                ForEach(presets.suffix(4), id: \.self) { days in
+                    CycleDayChip(
+                        days: days,
+                        isSelected: currentCycle == days,
+                        onTap: { onSelect(days) }
+                    )
+                }
+                Spacer()
+            }
+            
+            // Show indicator if current cycle isn't a preset
+            if !presets.contains(currentCycle) {
+                HStack(spacing: 4) {
+                    Image(systemName: "info.circle")
+                        .font(.caption2)
+                    Text("Custom: \(currentCycle) days (set from Hub)")
+                        .font(.caption2)
+                }
+                .foregroundColor(.secondary)
+            }
+        }
+    }
+}
+
+// MARK: - Individual Chip
+
+struct CycleDayChip: View {
+    let days: Int
+    let isSelected: Bool
+    let onTap: () -> Void
+    
+    var body: some View {
+        Button(action: onTap) {
+            Text(chipLabel)
+                .font(.caption.bold().monospacedDigit())
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .frame(minWidth: 44, minHeight: 36)  // Minimum tap target for gloves
+                .background(isSelected ? Color.blue : Color(.tertiarySystemBackground))
+                .foregroundColor(isSelected ? .white : .primary)
+                .cornerRadius(8)
+        }
+        .buttonStyle(.plain)
+    }
+    
+    private var chipLabel: String {
+        if days < 30 { return "\(days)d" }
+        if days == 30 { return "30d" }
+        if days == 60 { return "60d" }
+        if days == 90 { return "90d" }
+        if days == 120 { return "120d" }
+        if days == 180 { return "6mo" }
+        if days == 360 { return "1yr" }
+        return "\(days)d"
+    }
+}
 #Preview { FieldMapView() }
