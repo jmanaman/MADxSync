@@ -4,6 +4,8 @@
 //
 //  Spatial data models for district boundaries, fields, polylines, point sites, storm drains
 //
+//  UPDATED: Added showPendingSources to LayerVisibility for Add Sources feature
+//
 
 import Foundation
 import MapKit
@@ -313,9 +315,10 @@ class LayerVisibility: ObservableObject {
     @Published var showPolylines: Bool = false
     @Published var showPointSites: Bool = false
     @Published var showStormDrains: Bool = false
+    @Published var showPendingSources: Bool = true
     
     // Convenience for checking if any layers need loading
     var anyVisible: Bool {
-        showBoundaries || showFields || showPolylines || showPointSites || showStormDrains
+        showBoundaries || showFields || showPolylines || showPointSites || showStormDrains || showPendingSources
     }
 }

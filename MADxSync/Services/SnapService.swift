@@ -5,6 +5,9 @@
 //  Snap tap coordinates to nearby point sites and storm drains for precise marker placement.
 //  Returns the snapped coordinate and source name if within threshold, otherwise returns nil.
 //
+//  UPDATED: Added pendingSources parameter for Add Sources feature.
+//  Default value [] means all existing call sites work without changes.
+//
 
 import Foundation
 import CoreLocation
@@ -28,7 +31,8 @@ class SnapService {
     static func checkSnap(
         coordinate: CLLocationCoordinate2D,
         pointSites: [PointSite],
-        stormDrains: [StormDrain]
+        stormDrains: [StormDrain],
+        pendingSources: [PendingSource] = []
     ) -> SnapResult? {
         
         var closestResult: SnapResult? = nil
@@ -64,6 +68,25 @@ class SnapService {
                     sourceName: drain.name ?? "Storm Drain",
                     sourceType: "stormdrain",
                     sourceId: drain.id
+                )
+            }
+        }
+        
+        // Check pending point sources (snap to temporary sources too)
+        for source in pendingSources {
+            // Only snap to point types, not multi-point vertex sources
+            guard !source.sourceType.isMultiPoint else { continue }
+            guard let sourceCoord = source.coordinate else { continue }
+            
+            let distance = distanceMeters(from: coordinate, to: sourceCoord)
+            
+            if distance < closestDistance {
+                closestDistance = distance
+                closestResult = SnapResult(
+                    coordinate: sourceCoord,
+                    sourceName: source.displayName,
+                    sourceType: source.sourceType.rawValue,
+                    sourceId: source.id
                 )
             }
         }

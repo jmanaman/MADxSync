@@ -288,16 +288,25 @@ class TreatmentStatusService: ObservableObject {
                 lookup[status.feature_id] = status
             }
             
-            statusByFeature = lookup
-            lastSync = Date()
-            saveToCache()
-            
-            // Clear local overrides that the Hub has now picked up
-            cleanupOverrides()
-            
-            statusVersion += 1  // Trigger map overlay rebuild
-            
-            print("[TreatmentStatus] Synced \(statuses.count) feature statuses from Hub (v\(statusVersion))")
+            // Only update if data actually changed (avoid unnecessary map rebuilds)
+                let dataChanged = lookup.count != statusByFeature.count ||
+                    lookup.contains { key, value in
+                        statusByFeature[key]?.color != value.color ||
+                        statusByFeature[key]?.days_since != value.days_since ||
+                        statusByFeature[key]?.cycle_days != value.cycle_days
+                    }
+                        
+                statusByFeature = lookup
+                lastSync = Date()
+                saveToCache()
+                        
+                // Clear local overrides that the Hub has now picked up
+                cleanupOverrides()
+                        
+                if dataChanged {
+                    statusVersion += 1  // Trigger map overlay rebuild
+                    print("[TreatmentStatus] Synced \(statuses.count) feature statuses from Hub (v\(statusVersion)) — data changed")
+                }
             
             // Push any pending cycle updates after successful sync
             await pushPendingCycleUpdates()

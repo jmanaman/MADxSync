@@ -57,24 +57,29 @@ struct MADxSyncApp: App {
         case .active:
             // App came to foreground
             print("[Lifecycle] → Active (from \(oldPhase))")
-            
+                    
             // 1. Check auth token validity — refresh if needed, but DON'T sign out on failure
             if authService.isAuthenticated {
                 Task {
                     await authService.refreshAccessTokenSafe()
                 }
             }
-            
+                    
             // 2. Resume FLO polling (FLOService internally checks NetworkMonitor.isFLOWiFi)
             if authService.isAuthenticated {
-                FLOService.shared.resumePolling()
+                        FLOService.shared.resumePolling()
             }
-            
+                    
             // 3. NavigationService continues in background (iOS allows background location)
             //    but HeadingArrowView guards prevent animation crashes via applicationState check
-            
+                    
             // 4. If we were in background for a while, district data might be stale
             //    DistrictService will use cache if offline
+                    
+            // 5. Start HUB sync polling (60s interval, pulls pending sources + treatment status)
+            if authService.isAuthenticated {
+                        HubSyncService.shared.start()
+            }
             
         case .inactive:
             // App is transitioning (e.g., notification center pulled down, app switcher)
@@ -84,14 +89,17 @@ struct MADxSyncApp: App {
         case .background:
             // App fully backgrounded
             print("[Lifecycle] → Background")
-            
+                    
             // 1. Pause FLO polling — no point hitting 192.168.4.1 in background
             FLOService.shared.pausePolling()
-            
-            // 2. Cancel non-critical pending work
+                    
+            // 2. Stop HUB sync polling — no point polling Supabase in background
+            HubSyncService.shared.stop()
+                    
+            // 3. Cancel non-critical pending work
             //    (NavigationService GPS continues — iOS allows background location updates)
-            
-            // 3. Auth timer continues — it's lightweight and needs to keep tokens fresh
+                    
+            // 4. Auth timer continues — it's lightweight and needs to keep tokens fresh
             //    for when we come back to foreground
             
         @unknown default:

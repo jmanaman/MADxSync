@@ -55,6 +55,14 @@ struct LayerToggleView: View {
                         color: .blue,
                         isOn: $visibility.showStormDrains
                     )
+                                        
+                     LayerToggleRow(
+                         icon: "plus.circle.fill",
+                         title: "Pending Sources",
+                         subtitle: "\(AddSourceService.shared.sources.count) temporary",
+                         color: .teal,
+                         isOn: $visibility.showPendingSources
+                    )
                 }
                 
                 Section("Data Status") {

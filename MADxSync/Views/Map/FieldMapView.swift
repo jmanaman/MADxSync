@@ -25,6 +25,7 @@ enum ActiveTool: Equatable {
     case larvae
     case note
     case navigate
+    case addSource
 }
 
 /// Main map view with rapid tap-to-drop tools
@@ -36,6 +37,8 @@ struct FieldMapView: View {
     @StateObject private var routeService = RouteService.shared
     @ObservedObject private var floService = FLOService.shared
     @ObservedObject private var markerStore = MarkerStore.shared
+    @StateObject private var addSourceTool = AddSourceToolState()
+    @ObservedObject private var addSourceService = AddSourceService.shared
     
     @State private var mapRegion = MKCoordinateRegion(
         center: CLLocationCoordinate2D(latitude: 36.2077, longitude: -119.3473),
@@ -112,6 +115,18 @@ struct FieldMapView: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
                 
+                if activeTool == .addSource && addSourceTool.isArmed {
+                    AddSourceContextStrip(
+                        toolState: addSourceTool,
+                        onDone: { finishMultiPointSource() },
+                        onUndoVertex: { undoLastAddSourceVertex() },
+                        onCancel: { cancelAddSource() }
+                    )
+                    .padding(.horizontal, 12)
+                    .padding(.top, 4)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                
                 Spacer()
                 bottomBar
             }
@@ -166,6 +181,10 @@ struct FieldMapView: View {
                     .presentationDetents([.medium, .large])
             }
         }
+        .sheet(isPresented: $addSourceTool.showForm) {
+            AddSourceFormSheet(toolState: addSourceTool)
+                .presentationDetents([.large])
+        }
         .onChange(of: routeService.hasArrived) { arrived in
             if arrived {
                 let impact = UIImpactFeedbackGenerator(style: .heavy)
@@ -180,7 +199,8 @@ struct FieldMapView: View {
         let snapResult = SnapService.checkSnap(
             coordinate: coordinate,
             pointSites: spatialService.pointSites,
-            stormDrains: spatialService.stormDrains
+            stormDrains: spatialService.stormDrains,
+            pendingSources: AddSourceService.shared.sources
         )
         
         let finalCoordinate = snapResult?.coordinate ?? coordinate
@@ -226,6 +246,8 @@ struct FieldMapView: View {
             if let feature = feature {
                 Task { await startNavigation(to: feature) }
             }
+        case .addSource:
+            handleAddSourceTap(finalCoordinate)
         }
     }
     
@@ -496,6 +518,23 @@ struct FieldMapView: View {
                     .background(activeTool == .navigate ? Color.purple : Color(.systemBackground))
                     .clipShape(Circle()).shadow(radius: 4)
             }
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    if activeTool == .addSource {
+                        cancelAddSource()
+                    } else {
+                        activeTool = .addSource
+                        addSourceTool.isActive = true
+                        addSourceTool.showForm = true
+                    }
+                }
+            }) {
+                Image(systemName: "plus.circle.fill").font(.title2)
+                    .foregroundColor(activeTool == .addSource ? .white : .teal)
+                    .frame(width: 56, height: 56)
+                    .background(activeTool == .addSource ? Color.teal : Color(.systemBackground))
+                    .clipShape(Circle()).shadow(radius: 4)
+            }
             if !markerStore.markers.isEmpty {
                 Button(action: undoLastMarker) {
                     Image(systemName: "arrow.uturn.backward").font(.title3).foregroundColor(.orange)
@@ -646,6 +685,11 @@ struct FieldMapView: View {
         case .larvae: return "TAP FOR LARVAE 🦟"
         case .note: return "TAP TO NOTE 📝"
         case .navigate: return "TAP SOURCE TO NAVIGATE 🧭"
+        case .addSource:
+            if addSourceTool.selectedType.isMultiPoint {
+                return "TAP TO DROP VERTEX 📌"
+            }
+            return "TAP TO PLACE SOURCE 📌"
         }
     }
     
@@ -656,6 +700,7 @@ struct FieldMapView: View {
         case .larvae: return .green
         case .note: return .orange
         case .navigate: return .purple
+        case .addSource: return .teal
         }
     }
     
@@ -673,6 +718,85 @@ struct FieldMapView: View {
         }
         let impact = UIImpactFeedbackGenerator(style: .light)
         impact.impactOccurred()
+    }
+    
+    // MARK: - Add Source Methods
+    
+    private func handleAddSourceTap(_ coordinate: CLLocationCoordinate2D) {
+        guard addSourceTool.isArmed else { return }
+        
+        guard let districtId = AuthService.shared.districtId, !districtId.isEmpty else {
+            print("[AddSource] ⚠️ Cannot create source — no district_id. Auth may be stale.")
+            cancelAddSource()
+            return
+        }
+        
+        let service = AddSourceService.shared
+        let createdBy = AuthService.shared.currentUser?.userName
+            ?? AuthService.shared.currentUser?.email
+            ?? "app"
+        
+        if addSourceTool.selectedType.isMultiPoint {
+            if let sourceId = addSourceTool.activeSourceId {
+                service.addVertex(to: sourceId, coordinate: coordinate)
+            } else {
+                let source = PendingSource(
+                    districtId: districtId,
+                    sourceType: addSourceTool.selectedType,
+                    name: addSourceTool.formName,
+                    sourceSubtype: addSourceTool.formSubtype,
+                    condition: addSourceTool.formCondition,
+                    description: addSourceTool.formDescription,
+                    geometry: .multiPoint([coordinate]),
+                    createdBy: createdBy
+                )
+                service.createSource(source)
+                addSourceTool.activeSourceId = source.id
+            }
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+            mapRefreshTrigger += 1
+            
+        } else {
+            let source = PendingSource(
+                districtId: districtId,
+                sourceType: addSourceTool.selectedType,
+                name: addSourceTool.formName,
+                sourceSubtype: addSourceTool.formSubtype,
+                condition: addSourceTool.formCondition,
+                description: addSourceTool.formDescription,
+                geometry: .point(coordinate),
+                createdBy: createdBy
+            )
+            service.createSource(source)
+            UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+            addSourceTool.reset()
+            activeTool = .none
+            mapRefreshTrigger += 1
+        }
+    }
+    
+    private func finishMultiPointSource() {
+        addSourceTool.reset()
+        activeTool = .none
+        mapRefreshTrigger += 1
+        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    }
+    
+    private func undoLastAddSourceVertex() {
+        guard let sourceId = addSourceTool.activeSourceId else { return }
+        if AddSourceService.shared.undoLastVertex(sourceId: sourceId) {
+            mapRefreshTrigger += 1
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        }
+    }
+    
+    private func cancelAddSource() {
+        if let sourceId = addSourceTool.activeSourceId {
+            AddSourceService.shared.deleteSource(sourceId)
+        }
+        addSourceTool.reset()
+        activeTool = .none
+        mapRefreshTrigger += 1
     }
 }
 
@@ -778,6 +902,9 @@ struct SpatialMapView: UIViewRepresentable {
         private var lastShowPointSites = true
         private var lastShowStormDrains = true
         private var lastShowBoundaries = true
+        private var lastShowPendingSources = true
+        private var lastPendingSourceCount = 0
+        private var lastPendingVertexCount = 0
         private var lastMarkerCount = 0
         private var lastRoutePolyline: MKPolyline? = nil
         var lastIsFollowing = false
@@ -873,6 +1000,9 @@ struct SpatialMapView: UIViewRepresentable {
                 || visibility.showPointSites != lastShowPointSites
                 || visibility.showStormDrains != lastShowStormDrains
                 || visibility.showBoundaries != lastShowBoundaries
+                || visibility.showPendingSources != lastShowPendingSources
+                || AddSourceService.shared.sources.count != lastPendingSourceCount
+                            || AddSourceService.shared.sources.reduce(0, { $0 + $1.vertexCount }) != lastPendingVertexCount
                 || statusVersion != lastStatusVersion
             
             lastBoundaryCount = service.boundaries.count
@@ -881,6 +1011,9 @@ struct SpatialMapView: UIViewRepresentable {
             lastShowPointSites = visibility.showPointSites
             lastShowStormDrains = visibility.showStormDrains
             lastShowBoundaries = visibility.showBoundaries
+            lastShowPendingSources = visibility.showPendingSources
+            lastPendingSourceCount = AddSourceService.shared.sources.count
+            lastPendingVertexCount = AddSourceService.shared.sources.reduce(0, { $0 + $1.vertexCount })
             
             return dirty
         }
@@ -1011,6 +1144,7 @@ struct SpatialMapView: UIViewRepresentable {
             updatePolylinesComposite(mapView: mapView, show: visibility.showPolylines, data: service.polylines)
             updatePointSites(mapView: mapView, show: visibility.showPointSites, data: service.pointSites)
             updateStormDrains(mapView: mapView, show: visibility.showStormDrains, data: service.stormDrains)
+            updatePendingSourceOverlays(mapView: mapView, show: visibility.showPendingSources)
             lastStatusVersion = parent.treatmentStatusService.statusVersion
         }
         
@@ -1100,6 +1234,81 @@ struct SpatialMapView: UIViewRepresentable {
             lastStormDrainCount = data.count
         }
         
+        private func updatePendingSourceOverlays(mapView: MKMapView, show: Bool) {
+            // Remove existing pending overlays
+            let overlaysToRemove = mapView.overlays.filter { overlay in
+                if let composite = overlay as? CompositePointOverlay {
+                    return composite.pointType == .pendingPointSite
+                        || composite.pointType == .pendingStormDrain
+                }
+                if let polyline = overlay as? MKPolyline,
+                   let title = polyline.title, title.hasPrefix("PENDING_VERTICES_") {
+                    return true
+                }
+                return false
+            }
+            if !overlaysToRemove.isEmpty { mapView.removeOverlays(overlaysToRemove) }
+            
+            // Remove existing vertex annotations
+            let annotationsToRemove = mapView.annotations.compactMap { $0 as? PendingVertexAnnotation }
+            if !annotationsToRemove.isEmpty { mapView.removeAnnotations(annotationsToRemove) }
+            
+            guard show else { return }
+            
+            let sources = AddSourceService.shared.sources
+            guard !sources.isEmpty else { return }
+            
+            let statusService = parent.treatmentStatusService
+            
+            // Pending point sites
+            let pendingPoints = sources.filter { $0.sourceType == .pointsite }
+            if !pendingPoints.isEmpty {
+                let overlay = CompositePointOverlay(
+                    pendingSources: pendingPoints,
+                    sourceType: .pendingPointSite,
+                    colorForFeature: { statusService.colorForFeature($0) }
+                )
+                mapView.addOverlay(overlay, level: .aboveLabels)
+            }
+            
+            // Pending storm drains
+            let pendingDrains = sources.filter { $0.sourceType == .stormdrain }
+            if !pendingDrains.isEmpty {
+                let overlay = CompositePointOverlay(
+                    pendingSources: pendingDrains,
+                    sourceType: .pendingStormDrain,
+                    colorForFeature: { statusService.colorForFeature($0) }
+                )
+                mapView.addOverlay(overlay, level: .aboveLabels)
+            }
+            
+            // Multi-point sources → numbered vertex annotations + dotted connecting lines
+            let multiPointSources = sources.filter { $0.sourceType.isMultiPoint }
+            for source in multiPointSources {
+                let coords = source.allCoordinates
+                guard !coords.isEmpty else { continue }
+                
+                for (index, coord) in coords.enumerated() {
+                    let annotation = PendingVertexAnnotation(
+                        coordinate: coord,
+                        vertexNumber: index + 1,
+                        sourceId: source.id,
+                        sourceType: source.sourceType
+                    )
+                    mapView.addAnnotation(annotation)
+                }
+                
+                if coords.count >= 2 {
+                    var lineCoords = coords
+                    let polyline = MKPolyline(coordinates: &lineCoords, count: lineCoords.count)
+                    polyline.title = "PENDING_VERTICES_\(source.id)"
+                    mapView.addOverlay(polyline, level: .aboveLabels)
+                }
+            }
+            
+            lastPendingSourceCount = sources.count
+        }
+        
         // MARK: - Update Markers
         
         func updateMarkers(mapView: MKMapView, markers: [FieldMarker]) {
@@ -1121,6 +1330,17 @@ struct SpatialMapView: UIViewRepresentable {
         
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if annotation is MKUserLocation { return nil }
+            
+            if let vertex = annotation as? PendingVertexAnnotation {
+                let id = "PendingVertex"
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: id)
+                    ?? MKAnnotationView(annotation: annotation, reuseIdentifier: id)
+                view.annotation = annotation
+                view.image = vertex.markerImage
+                view.canShowCallout = false
+                return view
+            }
+            
             if let markerAnnotation = annotation as? MarkerAnnotation {
                 let identifier = "FieldMarker"
                 var view = mapView.dequeueReusableAnnotationView(withIdentifier: identifier)
@@ -1136,6 +1356,16 @@ struct SpatialMapView: UIViewRepresentable {
         }
         
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            // Pending source vertex connecting lines (dotted)
+            if let polyline = overlay as? MKPolyline,
+               let title = polyline.title, title.hasPrefix("PENDING_VERTICES_") {
+                let r = MKPolylineRenderer(polyline: polyline)
+                r.strokeColor = UIColor.systemTeal.withAlphaComponent(0.6)
+                r.lineWidth = 2
+                r.lineDashPattern = [8, 6]
+                return r
+            }
+            
             if let polygon = overlay as? MKPolygon, polygon.title == "SELECTED_FIELD" {
                 let r = MKPolygonRenderer(polygon: polygon)
                 r.strokeColor = UIColor.systemYellow
