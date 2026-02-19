@@ -154,6 +154,11 @@ enum LarvaeLevel: String, CaseIterable, Identifiable {
 
 // MARK: - Field Marker
 /// A marker placed on the map representing a treatment, inspection, observation, or note
+///
+/// UPDATED: 2026-02-14 — Added featureId and featureType for polyline snap matching.
+/// When a treatment diamond is dropped near a canal, the app snaps to the nearest
+/// point on the line and stores the polyline's ID here. The HUB uses this for
+/// direct feature matching instead of spatial proximity.
 struct FieldMarker: Identifiable, Codable {
     let id: UUID
     let timestamp: Date
@@ -178,6 +183,10 @@ struct FieldMarker: Identifiable, Codable {
     // Note tool — field note destined for source_notes table
     var noteText: String?
     
+    // Feature matching (polyline snap, polygon hit, point site snap)
+    var featureId: String?       // ID of the spatial feature this marker was matched to
+    var featureType: String?     // "field", "polyline", "pointsite", "stormdrain"
+    
     // Sync tracking
     var syncedToFLO: Bool
     var syncedToSupabase: Bool
@@ -194,7 +203,9 @@ struct FieldMarker: Identifiable, Codable {
         larvae: String? = nil,
         pupaePresent: Bool = false,
         notes: String? = nil,
-        noteText: String? = nil
+        noteText: String? = nil,
+        featureId: String? = nil,
+        featureType: String? = nil
     ) {
         self.id = UUID()
         self.timestamp = Date()
@@ -210,6 +221,8 @@ struct FieldMarker: Identifiable, Codable {
         self.pupaePresent = pupaePresent
         self.notes = notes
         self.noteText = noteText
+        self.featureId = featureId
+        self.featureType = featureType
         self.syncedToFLO = false
         self.syncedToSupabase = false
     }
@@ -321,6 +334,10 @@ struct FieldMarker: Identifiable, Codable {
         
         // Notes
         if let notes = notes, !notes.isEmpty { payload["notes"] = notes }
+        
+        // Feature matching — allows HUB to match by ID instead of proximity
+        if let featureId = featureId { payload["feature_id"] = featureId }
+        if let featureType = featureType { payload["feature_type"] = featureType }
         
         return payload
     }

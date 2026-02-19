@@ -251,28 +251,68 @@ struct FieldMapView: View {
         }
     }
     
-    // MARK: - Drop Treatment Marker
-    private func dropTreatmentMarker(at coordinate: CLLocationCoordinate2D, snappedTo: SnapResult? = nil) {
-        let marker = FieldMarker(
-            lat: coordinate.latitude,
-            lon: coordinate.longitude,
-            family: treatmentFamily.rawValue,
-            status: treatmentStatus.rawValue,
-            chemical: selectedChemical,
-            doseValue: doseValue,
-            doseUnit: doseUnit.rawValue
-        )
-        
-        markerStore.addMarker(marker)
-        
-        if treatmentStatus == .treated || treatmentStatus == .observed {
+    // ============================================
+    // FieldMapView.swift — dropTreatmentMarker REPLACEMENT
+    // ============================================
+    //
+    // WHAT CHANGED:
+    // When a treatment diamond is dropped near a polyline (canal/ditch),
+    // the marker now SNAPS to the nearest point on the line instead of
+    // landing wherever the tech's finger hit. The snapped coordinate and
+    // feature_id are stored on the marker for HUB matching.
+    //
+    // Flow:
+    // 1. Check if tapped near a point site/storm drain (existing snap)
+    // 2. NEW: Check if tapped near a polyline → snap to nearest point on line
+    // 3. Fall back to polygon point-in-polygon hit test
+    // 4. Create marker with snapped coordinate + feature_id + feature_type
+    //
+    // INSTALL: Replace the existing dropTreatmentMarker() in FieldMapView.swift
+    // ============================================
+
+        // MARK: - Drop Treatment Marker (with Polyline Snap)
+        private func dropTreatmentMarker(at coordinate: CLLocationCoordinate2D, snappedTo: SnapResult? = nil) {
+            
+            var finalCoordinate = coordinate
             var featureId: String? = nil
             var featureType: String? = nil
             
+            // 1. Point site / storm drain snap (existing behavior)
             if let snap = snappedTo {
+                finalCoordinate = snap.coordinate
                 featureId = snap.sourceId
                 featureType = snap.sourceType
-            } else {
+            }
+            
+            // 2. Polyline snap — if not already snapped to a point source
+            // Only snap to polylines if the polyline layer is visible
+            if featureId == nil && layerVisibility.showPolylines {
+                if let snapResult = SpatialHitTester.snapToPolyline(
+                    coordinate: coordinate,
+                    polylines: spatialService.polylines
+                ) {
+                    // Snap marker to the nearest point on the polyline
+                    finalCoordinate = snapResult.snappedCoordinate
+                    featureId = snapResult.polyline.id
+                    featureType = "polyline"
+                    
+                    // Show snap toast
+                    snapSourceName = snapResult.polyline.name ?? "Canal/Ditch"
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        showSnapToast = true
+                    }
+                    let impact = UIImpactFeedbackGenerator(style: .rigid)
+                    impact.impactOccurred()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        withAnimation(.easeIn(duration: 0.2)) {
+                            showSnapToast = false
+                        }
+                    }
+                }
+            }
+            
+            // 3. Polygon / other hit test — if still no feature matched
+            if featureId == nil {
                 let hitFeature = SpatialHitTester.hitTest(
                     coordinate: coordinate,
                     fields: spatialService.fields,
@@ -291,27 +331,45 @@ struct FieldMapView: View {
                 }
             }
             
-            if let fId = featureId, let fType = featureType {
-                treatmentStatusService.markTreatedLocally(featureId: fId, featureType: fType, chemical: selectedChemical)
-                treatedFeatureStack.append(fId)
+            // 4. Create marker with snapped coordinate and feature info
+            let marker = FieldMarker(
+                lat: finalCoordinate.latitude,
+                lon: finalCoordinate.longitude,
+                family: treatmentFamily.rawValue,
+                status: treatmentStatus.rawValue,
+                chemical: selectedChemical,
+                doseValue: doseValue,
+                doseUnit: doseUnit.rawValue,
+                featureId: featureId,       // NEW — stored for HUB matching
+                featureType: featureType    // NEW — stored for HUB matching
+            )
+            
+            markerStore.addMarker(marker)
+            
+            // 5. Optimistic local treatment status update
+            if treatmentStatus == .treated || treatmentStatus == .observed {
+                if let fId = featureId, let fType = featureType {
+                    treatmentStatusService.markTreatedLocally(featureId: fId, featureType: fType, chemical: selectedChemical)
+                    treatedFeatureStack.append(fId)
+                } else {
+                    treatedFeatureStack.append("")
+                }
             } else {
                 treatedFeatureStack.append("")
             }
-        } else {
-            treatedFeatureStack.append("")
-        }
-        
-        let impact = UIImpactFeedbackGenerator(style: .medium)
-        impact.impactOccurred()
-        
-        if floService.isConnected {
-            Task {
-                let payload = marker.toFLOPayload()
-                let success = await floService.postViewerLog(payload: payload)
-                if success { markerStore.markSyncedToFLO(marker) }
+            
+            let impact = UIImpactFeedbackGenerator(style: .medium)
+            impact.impactOccurred()
+            
+            // 6. Sync to FLO if connected
+            if floService.isConnected {
+                Task {
+                    let payload = marker.toFLOPayload()
+                    let success = await floService.postViewerLog(payload: payload)
+                    if success { markerStore.markSyncedToFLO(marker) }
+                }
             }
         }
-    }
     
     // MARK: - Drop Larvae Marker
     private func dropLarvaeMarker(level: LarvaeLevel, pupae: Bool) {
