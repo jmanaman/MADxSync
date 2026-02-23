@@ -99,6 +99,8 @@ final class HubSyncService: ObservableObject {
         Task { await pullPendingSources() }
         Task { await pullTreatmentStatus() }
         Task { await refreshSpatialIfDue() }
+        Task { await pullSourceFinderPins() }
+        Task { await pullServiceRequests() }
     }
     
     // MARK: - Channel: Spatial Layers (Hourly + Promotion Triggered)
@@ -292,6 +294,30 @@ final class HubSyncService: ObservableObject {
             await TreatmentStatusService.shared.syncFromHub()
             recordSuccess(channel)
         }
+    
+    // MARK: - Channel: Source Finder Pins
+    
+    private func pullSourceFinderPins() async {
+        let channel = "sourceFinderPins"
+        guard !isBusy(channel) else { return }
+        setBusy(channel, true)
+        defer { setBusy(channel, false) }
+        
+        await SourceFinderService.shared.pullFromHub()
+        recordSuccess(channel)
+    }
+    
+    // MARK: - Channel: Service Requests
+    
+    private func pullServiceRequests() async {
+        let channel = "serviceRequests"
+        guard !isBusy(channel) else { return }
+        setBusy(channel, true)
+        defer { setBusy(channel, false) }
+        
+        await ServiceRequestService.shared.pullFromHub()
+        recordSuccess(channel)
+    }
     
     // MARK: - Authenticated GET
     

@@ -39,6 +39,10 @@ struct FieldMapView: View {
     @ObservedObject private var markerStore = MarkerStore.shared
     @StateObject private var addSourceTool = AddSourceToolState()
     @ObservedObject private var addSourceService = AddSourceService.shared
+    @StateObject private var sourceFinderController = SourceFinderMapController()
+    @ObservedObject private var sourceFinderService = SourceFinderService.shared
+    @StateObject private var serviceRequestController = ServiceRequestMapController()
+    @ObservedObject private var serviceRequestService = ServiceRequestService.shared
     
     @State private var mapRegion = MKCoordinateRegion(
         center: CLLocationCoordinate2D(latitude: 36.2077, longitude: -119.3473),
@@ -79,6 +83,8 @@ struct FieldMapView: View {
                 navigationService: navigationService,
                 routeService: routeService,
                 activeTool: activeTool,
+                sourceFinderController: sourceFinderController,
+                serviceRequestController: serviceRequestController,
                 onTap: { coordinate, screenPoint in
                     handleMapTap(coordinate, screenPoint: screenPoint)
                 },
@@ -106,6 +112,44 @@ struct FieldMapView: View {
                 NavigationBannerView(routeService: routeService) {
                     routeService.cancelNavigation()
                     activeTool = .none
+                }
+                
+                // Source Finder shout-out banner
+                if sourceFinderController.showBanner {
+                    SourceFinderBannerView(
+                        pin: sourceFinderController.bannerPin,
+                        currentIndex: sourceFinderController.bannerCurrentIndex,
+                        totalCount: sourceFinderController.bannerTotalCount,
+                        onDismiss: { sourceFinderController.dismissBanner() },
+                        onNavigate: {
+                            if let pin = sourceFinderController.bannerPin {
+                                sourceFinderController.dismissBanner()
+                                Task { await sourceFinderController.navigateToPin(pin) }
+                                activeTool = .navigate
+                            }
+                        }
+                    )
+                    .padding(.top, 4)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                
+                // Service Request shout-out banner
+                if serviceRequestController.showBanner {
+                    ServiceRequestBannerView(
+                        request: serviceRequestController.bannerRequest,
+                        currentIndex: serviceRequestController.bannerCurrentIndex,
+                        totalCount: serviceRequestController.bannerTotalCount,
+                        onDismiss: { serviceRequestController.dismissBanner() },
+                        onNavigate: {
+                            if let req = serviceRequestController.bannerRequest {
+                                serviceRequestController.dismissBanner()
+                                Task { await serviceRequestController.navigateToRequest(req) }
+                                activeTool = .navigate
+                            }
+                        }
+                    )
+                    .padding(.top, 4)
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
                 
                 if activeTool == .treatment {
@@ -151,6 +195,38 @@ struct FieldMapView: View {
                     .transition(.opacity)
             }
             
+            // Source Finder post-treatment inspection modal
+            if sourceFinderController.showInspectionModal, let pin = sourceFinderController.inspectionPin {
+                SourceFinderInspectionModal(
+                    pin: pin,
+                    onSubmit: { findings, recommend in
+                        sourceFinderController.submitInspection(findings: findings, recommendPermanent: recommend)
+                        mapRefreshTrigger += 1
+                    },
+                    onCancel: {
+                        sourceFinderController.showInspectionModal = false
+                        sourceFinderController.inspectionPin = nil
+                    }
+                )
+                .transition(.opacity)
+            }
+            
+            // Service Request post-treatment inspection modal
+            if serviceRequestController.showInspectionModal, let req = serviceRequestController.inspectionRequest {
+                ServiceRequestInspectionModal(
+                    request: req,
+                    onSubmit: { findings, recommend in
+                        serviceRequestController.submitInspection(findings: findings, recommendPermanent: recommend)
+                        mapRefreshTrigger += 1
+                    },
+                    onCancel: {
+                        serviceRequestController.showInspectionModal = false
+                        serviceRequestController.inspectionRequest = nil
+                    }
+                )
+                .transition(.opacity)
+            }
+            
             SnapToastView(sourceName: snapSourceName, isVisible: showSnapToast)
                 .allowsHitTesting(false)
         }
@@ -185,6 +261,42 @@ struct FieldMapView: View {
             AddSourceFormSheet(toolState: addSourceTool)
                 .presentationDetents([.large])
         }
+        .sheet(isPresented: $sourceFinderController.showDetailSheet) {
+            if let pin = sourceFinderController.detailPin {
+                SourceFinderDetailView(
+                    pin: pin,
+                    onNavigate: {
+                        sourceFinderController.showDetailSheet = false
+                        Task { await sourceFinderController.navigateToPin(pin) }
+                        activeTool = .navigate
+                    },
+                    onMarkInspected: {
+                        sourceFinderController.showDetailSheet = false
+                        sourceFinderController.inspectionPin = pin
+                        sourceFinderController.showInspectionModal = true
+                    }
+                )
+                .presentationDetents([.medium, .large])
+            }
+        }
+        .sheet(isPresented: $serviceRequestController.showDetailSheet) {
+            if let req = serviceRequestController.detailRequest {
+                ServiceRequestDetailView(
+                    request: req,
+                    onNavigate: {
+                        serviceRequestController.showDetailSheet = false
+                        Task { await serviceRequestController.navigateToRequest(req) }
+                        activeTool = .navigate
+                    },
+                    onMarkInspected: {
+                        serviceRequestController.showDetailSheet = false
+                        serviceRequestController.inspectionRequest = req
+                        serviceRequestController.showInspectionModal = true
+                    }
+                )
+                .presentationDetents([.medium, .large])
+            }
+        }
         .onChange(of: routeService.hasArrived) { arrived in
             if arrived {
                 let impact = UIImpactFeedbackGenerator(style: .heavy)
@@ -198,9 +310,11 @@ struct FieldMapView: View {
     private func handleMapTap(_ coordinate: CLLocationCoordinate2D, screenPoint: CGPoint) {
         let snapResult = SnapService.checkSnap(
             coordinate: coordinate,
-            pointSites: spatialService.pointSites,
-            stormDrains: spatialService.stormDrains,
-            pendingSources: AddSourceService.shared.sources
+            pointSites: layerVisibility.showPointSites ? spatialService.pointSites : [],
+            stormDrains: layerVisibility.showStormDrains ? spatialService.stormDrains : [],
+            pendingSources: layerVisibility.showPendingSources ? AddSourceService.shared.sources : [],
+            sourceFinderPins: SourceFinderService.shared.pins,
+            serviceRequestPins: ServiceRequestService.shared.requests
         )
         
         let finalCoordinate = snapResult?.coordinate ?? coordinate
@@ -251,24 +365,7 @@ struct FieldMapView: View {
         }
     }
     
-    // ============================================
-    // FieldMapView.swift — dropTreatmentMarker REPLACEMENT
-    // ============================================
-    //
-    // WHAT CHANGED:
-    // When a treatment diamond is dropped near a polyline (canal/ditch),
-    // the marker now SNAPS to the nearest point on the line instead of
-    // landing wherever the tech's finger hit. The snapped coordinate and
-    // feature_id are stored on the marker for HUB matching.
-    //
-    // Flow:
-    // 1. Check if tapped near a point site/storm drain (existing snap)
-    // 2. NEW: Check if tapped near a polyline → snap to nearest point on line
-    // 3. Fall back to polygon point-in-polygon hit test
-    // 4. Create marker with snapped coordinate + feature_id + feature_type
-    //
-    // INSTALL: Replace the existing dropTreatmentMarker() in FieldMapView.swift
-    // ============================================
+    
 
         // MARK: - Drop Treatment Marker (with Polyline Snap)
         private func dropTreatmentMarker(at coordinate: CLLocationCoordinate2D, snappedTo: SnapResult? = nil) {
@@ -357,6 +454,8 @@ struct FieldMapView: View {
             } else {
                 treatedFeatureStack.append("")
             }
+            
+            
             
             let impact = UIImpactFeedbackGenerator(style: .medium)
             impact.impactOccurred()
@@ -870,6 +969,8 @@ struct SpatialMapView: UIViewRepresentable {
     @ObservedObject var navigationService: NavigationService
     @ObservedObject var routeService: RouteService
     let activeTool: ActiveTool
+    var sourceFinderController: SourceFinderMapController?
+    var serviceRequestController: ServiceRequestMapController?
     let onTap: (CLLocationCoordinate2D, CGPoint) -> Void
     let onFeatureSelected: (SelectedFeature) -> Void
     
@@ -966,6 +1067,10 @@ struct SpatialMapView: UIViewRepresentable {
         private var lastMarkerCount = 0
         private var lastRoutePolyline: MKPolyline? = nil
         var lastIsFollowing = false
+        private var lastSourceFinderCount = 0
+        private var lastSourceFinderVersion = 0
+        private var lastServiceRequestCount = 0
+        private var lastServiceRequestVersion = 0
         
         init(_ parent: SpatialMapView) {
             self.parent = parent
@@ -1060,8 +1165,11 @@ struct SpatialMapView: UIViewRepresentable {
                 || visibility.showBoundaries != lastShowBoundaries
                 || visibility.showPendingSources != lastShowPendingSources
                 || AddSourceService.shared.sources.count != lastPendingSourceCount
-                            || AddSourceService.shared.sources.reduce(0, { $0 + $1.vertexCount }) != lastPendingVertexCount
+                || AddSourceService.shared.sources.reduce(0, { $0 + $1.vertexCount }) != lastPendingVertexCount
                 || statusVersion != lastStatusVersion
+                || SourceFinderService.shared.pins.count != lastSourceFinderCount
+                || TreatmentStatusService.shared.statusVersion != lastSourceFinderVersion
+                || ServiceRequestService.shared.requests.count != lastServiceRequestCount
             
             lastBoundaryCount = service.boundaries.count
             lastShowFields = visibility.showFields
@@ -1114,12 +1222,36 @@ struct SpatialMapView: UIViewRepresentable {
                 removeSelectionHighlight(mapView: mapView)
                 parent.onTap(coordinate, screenPoint)
             } else {
-                if let feature = feature {
-                    parent.onFeatureSelected(feature)
-                    addSelectionHighlight(feature: feature, mapView: mapView)
-                } else {
-                    removeSelectionHighlight(mapView: mapView)
-                    parent.onTap(coordinate, screenPoint)
+                // Check Source Finder pins first (they sit above spatial features)
+                var handledPin = false
+                for annotation in mapView.annotations {
+                    if let sfAnnotation = annotation as? SourceFinderAnnotation {
+                        let annotationPoint = mapView.convert(sfAnnotation.coordinate, toPointTo: mapView)
+                        let distance = hypot(annotationPoint.x - point.x, annotationPoint.y - point.y)
+                        if distance < 30 {
+                            parent.sourceFinderController?.handlePinTap(sfAnnotation.pin)
+                            handledPin = true
+                            break
+                        }
+                    } else if let srAnnotation = annotation as? ServiceRequestAnnotation {
+                        let annotationPoint = mapView.convert(srAnnotation.coordinate, toPointTo: mapView)
+                        let distance = hypot(annotationPoint.x - point.x, annotationPoint.y - point.y)
+                        if distance < 30 {
+                            parent.serviceRequestController?.handlePinTap(srAnnotation.request)
+                            handledPin = true
+                            break
+                        }
+                    }
+                }
+
+                if !handledPin {
+                    if let feature = feature {
+                        parent.onFeatureSelected(feature)
+                        addSelectionHighlight(feature: feature, mapView: mapView)
+                    } else {
+                        removeSelectionHighlight(mapView: mapView)
+                        parent.onTap(coordinate, screenPoint)
+                    }
                 }
             }
         }
@@ -1204,6 +1336,35 @@ struct SpatialMapView: UIViewRepresentable {
             updateStormDrains(mapView: mapView, show: visibility.showStormDrains, data: service.stormDrains)
             updatePendingSourceOverlays(mapView: mapView, show: visibility.showPendingSources)
             lastStatusVersion = parent.treatmentStatusService.statusVersion
+            updateSourceFinderPins(mapView: mapView)
+            updateServiceRequestPins(mapView: mapView)
+        }
+        
+        private func updateServiceRequestPins(mapView: MKMapView) {
+            let requests = ServiceRequestService.shared.requests
+            let count = requests.count
+            let version = TreatmentStatusService.shared.statusVersion
+
+            guard count != lastServiceRequestCount || version != lastServiceRequestVersion else { return }
+            lastServiceRequestCount = count
+            lastServiceRequestVersion = version
+
+            let existingAnnotations = mapView.annotations.compactMap { $0 as? ServiceRequestAnnotation }
+            if !existingAnnotations.isEmpty { mapView.removeAnnotations(existingAnnotations) }
+
+            let existingOverlays = mapView.overlays.filter { $0 is ServiceRequestPulseOverlay }
+            if !existingOverlays.isEmpty { mapView.removeOverlays(existingOverlays) }
+
+            guard !requests.isEmpty else { return }
+
+            for req in requests {
+                mapView.addAnnotation(ServiceRequestAnnotation(request: req))
+            }
+
+            let pendingOnly = requests.filter { ServiceRequestMapController.shouldPulse($0) }
+            if !pendingOnly.isEmpty {
+                mapView.addOverlay(ServiceRequestPulseOverlay(requests: pendingOnly), level: .aboveLabels)
+            }
         }
         
         private func updateBoundaries(mapView: MKMapView, show: Bool, data: [DistrictBoundary]) {
@@ -1366,6 +1527,39 @@ struct SpatialMapView: UIViewRepresentable {
             
             lastPendingSourceCount = sources.count
         }
+
+        // MARK: - Source Finder Pins
+
+        private func updateSourceFinderPins(mapView: MKMapView) {
+            let pins = SourceFinderService.shared.pins
+            let count = pins.count
+            let version = TreatmentStatusService.shared.statusVersion
+
+            // Rebuild if pin count changed OR treatment status changed (color rotation)
+            guard count != lastSourceFinderCount || version != lastSourceFinderVersion else { return }
+            lastSourceFinderCount = count
+            lastSourceFinderVersion = version
+
+            // Remove existing SF annotations and overlays
+            let existingAnnotations = mapView.annotations.compactMap { $0 as? SourceFinderAnnotation }
+            if !existingAnnotations.isEmpty { mapView.removeAnnotations(existingAnnotations) }
+
+            let existingOverlays = mapView.overlays.filter { $0 is SourceFinderPulseOverlay }
+            if !existingOverlays.isEmpty { mapView.removeOverlays(existingOverlays) }
+
+            guard !pins.isEmpty else { return }
+
+            // Add annotations for all pins
+            for pin in pins {
+                mapView.addAnnotation(SourceFinderAnnotation(pin: pin))
+            }
+
+            // Pulse overlay ONLY for pending pins (not inspected, not treated)
+            let pendingOnly = pins.filter { SourceFinderMapController.shouldPulse($0) }
+            if !pendingOnly.isEmpty {
+                mapView.addOverlay(SourceFinderPulseOverlay(pins: pendingOnly), level: .aboveLabels)
+            }
+        }
         
         // MARK: - Update Markers
         
@@ -1388,6 +1582,57 @@ struct SpatialMapView: UIViewRepresentable {
         
         func mapView(_ mapView: MKMapView, viewFor annotation: MKAnnotation) -> MKAnnotationView? {
             if annotation is MKUserLocation { return nil }
+            
+            if let sfAnnotation = annotation as? SourceFinderAnnotation {
+                let id = "SourceFinderPin"
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: id)
+                    ?? MKAnnotationView(annotation: annotation, reuseIdentifier: id)
+                view.annotation = annotation
+
+                // Color from TreatmentStatusService — same rotation as all other sources
+                view.image = sfAnnotation.markerImage
+                view.canShowCallout = false
+
+                // Pulse ONLY if pending (not yet inspected or treated)
+                if SourceFinderMapController.shouldPulse(sfAnnotation.pin) {
+                    let pulse = CABasicAnimation(keyPath: "transform.scale")
+                    pulse.fromValue = 1.0
+                    pulse.toValue = 1.3
+                    pulse.duration = 1.0
+                    pulse.autoreverses = true
+                    pulse.repeatCount = .infinity
+                    pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    view.layer.add(pulse, forKey: "sfPulse")
+                } else {
+                    view.layer.removeAnimation(forKey: "sfPulse")
+                }
+
+                return view
+            }
+            
+            if let srAnnotation = annotation as? ServiceRequestAnnotation {
+                let id = "ServiceRequestPin"
+                let view = mapView.dequeueReusableAnnotationView(withIdentifier: id)
+                    ?? MKAnnotationView(annotation: annotation, reuseIdentifier: id)
+                view.annotation = annotation
+                view.image = srAnnotation.markerImage
+                view.canShowCallout = false
+
+                if ServiceRequestMapController.shouldPulse(srAnnotation.request) {
+                    let pulse = CABasicAnimation(keyPath: "transform.scale")
+                    pulse.fromValue = 1.0
+                    pulse.toValue = 1.3
+                    pulse.duration = 1.0
+                    pulse.autoreverses = true
+                    pulse.repeatCount = .infinity
+                    pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                    view.layer.add(pulse, forKey: "srPulse")
+                } else {
+                    view.layer.removeAnimation(forKey: "srPulse")
+                }
+
+                return view
+            }
             
             if let vertex = annotation as? PendingVertexAnnotation {
                 let id = "PendingVertex"
@@ -1414,6 +1659,14 @@ struct SpatialMapView: UIViewRepresentable {
         }
         
         func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            if let sfOverlay = overlay as? SourceFinderPulseOverlay {
+                return SourceFinderPulseRenderer(overlay: sfOverlay)
+            }
+            
+            if let srOverlay = overlay as? ServiceRequestPulseOverlay {
+                return ServiceRequestPulseRenderer(overlay: srOverlay)
+            }
+            
             // Pending source vertex connecting lines (dotted)
             if let polyline = overlay as? MKPolyline,
                let title = polyline.title, title.hasPrefix("PENDING_VERTICES_") {
@@ -1581,20 +1834,7 @@ enum SelectedFeature {
     }
 }
 
-// ============================================
-// REPLACEMENT: FeatureInfoView
-// ============================================
-//
-// WHAT CHANGED:
-// Added CycleDayChips row in the Treatment Status section.
-// Tech taps a chip → cycle updates locally (map recolors immediately)
-// and writes to source_notes in Supabase (Hub picks it up next publish).
-//
-// The chips show: 7, 14, 21, 30, 60, 90, 120, 180, 360
-// Current cycle is highlighted. One tap to change.
-//
-// INSTALL: Replace entire FeatureInfoView in FieldMapView.swift
-// ============================================
+
 
 struct FeatureInfoView: View {
     let feature: SelectedFeature

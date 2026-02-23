@@ -32,7 +32,9 @@ class SnapService {
         coordinate: CLLocationCoordinate2D,
         pointSites: [PointSite],
         stormDrains: [StormDrain],
-        pendingSources: [PendingSource] = []
+        pendingSources: [PendingSource] = [],
+        sourceFinderPins: [SourceFinderPin] = [],
+        serviceRequestPins: [ServiceRequestPin] = []
     ) -> SnapResult? {
         
         var closestResult: SnapResult? = nil
@@ -87,6 +89,40 @@ class SnapService {
                     sourceName: source.displayName,
                     sourceType: source.sourceType.rawValue,
                     sourceId: source.id
+                )
+            }
+        }
+        
+        // Check Source Finder pins LAST — uses <= so SF pins win ties with
+                // pending sources at the same coordinate (pending source created from
+                // "Recommend Permanent" sits at identical coords as the SF pin)
+                for pin in sourceFinderPins {
+                    let pinCoord = pin.coordinate
+                    let distance = distanceMeters(from: coordinate, to: pinCoord)
+                    
+                    if distance <= closestDistance {
+                closestDistance = distance
+                closestResult = SnapResult(
+                    coordinate: pinCoord,
+                    sourceName: pin.displayTitle,
+                    sourceType: "sourcefinder",
+                    sourceId: pin.id
+                )
+            }
+        }
+        
+        // Check Service Request pins — same logic as SF pins
+        for req in serviceRequestPins {
+            let reqCoord = req.coordinate
+            let distance = distanceMeters(from: coordinate, to: reqCoord)
+            
+            if distance <= closestDistance {
+                closestDistance = distance
+                closestResult = SnapResult(
+                    coordinate: reqCoord,
+                    sourceName: req.displayTitle,
+                    sourceType: "servicerequest",
+                    sourceId: req.id
                 )
             }
         }
