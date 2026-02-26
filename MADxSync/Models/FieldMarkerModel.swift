@@ -796,13 +796,73 @@ class MarkerStore: ObservableObject {
     }
     
     // MARK: - Undo Last
-    
+        
     func undoLast() {
-        guard !markers.isEmpty else { return }
-        markers.removeLast()
-        updatePendingCount()
-        saveMarkers()
-    }
+            guard let lastMarker = markers.last else { return }
+            
+            var undoPayload = lastMarker.toSupabasePayload(
+                deviceId: deviceId,
+                truckId: TruckService.shared.selectedTruckId
+            )
+            undoPayload["marker_type"] = "UNDO"
+            undoPayload["undo_target_lat"] = lastMarker.lat
+            undoPayload["undo_target_lon"] = lastMarker.lon
+            undoPayload["undo_target_family"] = lastMarker.family ?? ""
+            undoPayload["undo_target_timestamp"] = lastMarker.timestampISO
+            
+            // Give the UNDO record its own timestamp — NOT the original marker's
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            undoPayload["timestamp_iso"] = formatter.string(from: Date())
+            
+            markers.removeLast()
+            updatePendingCount()
+            saveMarkers()
+            
+            Task {
+                await uploadUndoRecord(undoPayload)
+            }
+            
+            print("[MarkerStore] Undo: marker canceled via UNDO record")
+        }
+        /// Upload an UNDO record to app_markers. Uses same retry/auth pattern as normal uploads.
+        private func uploadUndoRecord(_ payload: [String: Any]) async {
+            guard let url = URL(string: "\(supabaseURL)/rest/v1/app_markers") else { return }
+            
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 15
+            request.setValue(supabaseKey, forHTTPHeaderField: "apikey")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("return=minimal", forHTTPHeaderField: "Prefer")
+            if let token = AuthService.shared.accessToken {
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            }
+            
+            do {
+                let jsonData = try JSONSerialization.data(withJSONObject: payload)
+                request.httpBody = jsonData
+                
+                let (_, response) = try await URLSession.shared.data(for: request)
+                
+                if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 401 {
+                    // Token expired — refresh and retry once
+                    let refreshed = await AuthService.shared.handleUnauthorized()
+                    if refreshed {
+                        if let token = AuthService.shared.accessToken {
+                            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                        }
+                        let (_, _) = try await URLSession.shared.data(for: request)
+                    }
+                }
+                
+                print("[MarkerStore] ✓ UNDO record uploaded to app_markers")
+            } catch {
+                // If upload fails, the Hub-side filter on viewer_logs will still catch the
+                // FLO UNDO_DIAMOND. This is belt-and-suspenders — both paths cancel the marker.
+                print("[MarkerStore] ⚠️ UNDO record upload failed: \(error.localizedDescription)")
+            }
+        }
     
     // MARK: - Stats for UI
     

@@ -869,10 +869,22 @@ struct FieldMapView: View {
     
     private func undoLastMarker() {
         guard !markerStore.markers.isEmpty else { return }
-        markerStore.markers.removeLast()
-        if let featureId = treatedFeatureStack.popLast(), !featureId.isEmpty {
-            treatmentStatusService.revertLocalTreatment(featureId: featureId)
+        
+        // Get the feature ID before undo removes the marker
+        let featureId = treatedFeatureStack.popLast() ?? ""
+        
+        markerStore.undoLast()
+        
+        // Only revert polygon color if NO other markers remain on this feature
+        if !featureId.isEmpty {
+            let stillHasMarkers = markerStore.markers.contains { marker in
+                marker.featureId == featureId && marker.family != nil
+            }
+            if !stillHasMarkers {
+                treatmentStatusService.revertLocalTreatment(featureId: featureId)
+            }
         }
+        
         let impact = UIImpactFeedbackGenerator(style: .light)
         impact.impactOccurred()
     }
