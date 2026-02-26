@@ -32,12 +32,13 @@ class AddSourceToolState: ObservableObject {
     @Published var formDescription: String = ""
     
     func reset() {
-        isActive = false
-        isArmed = false
-        showForm = false
-        activeSourceId = nil
-        clearForm()
-    }
+            isActive = false
+            isArmed = false
+            showForm = false
+            activeSourceId = nil
+            vertexCount = 0
+            clearForm()
+        }
     
     func clearForm() {
         formName = ""
@@ -51,11 +52,18 @@ class AddSourceToolState: ObservableObject {
         isArmed && selectedType.isMultiPoint && activeSourceId != nil
     }
     
-    /// Vertex count for active multi-point source. Safe — returns 0 if no active source.
-    var vertexCount: Int {
-        guard let sourceId = activeSourceId else { return 0 }
-        return AddSourceService.shared.source(byId: sourceId)?.vertexCount ?? 0
-    }
+    /// Vertex count — explicitly updated on every vertex add/undo.
+        /// @Published so SwiftUI re-renders the context strip reliably.
+        @Published var vertexCount: Int = 0
+        
+        /// Call after every vertex add/undo to keep count in sync
+        func refreshVertexCount() {
+            guard let sourceId = activeSourceId else {
+                vertexCount = 0
+                return
+            }
+            vertexCount = AddSourceService.shared.source(byId: sourceId)?.vertexCount ?? 0
+        }
     
     /// Whether the form has minimum required data to arm
     var canArm: Bool {

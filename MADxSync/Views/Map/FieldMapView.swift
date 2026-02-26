@@ -680,6 +680,11 @@ struct FieldMapView: View {
                     if activeTool == .addSource {
                         cancelAddSource()
                     } else {
+                        // Safety: clean up any orphaned source from a stuck session
+                        if let orphanedId = addSourceTool.activeSourceId {
+                            AddSourceService.shared.deleteSource(orphanedId)
+                            addSourceTool.reset()
+                        }
                         activeTool = .addSource
                         addSourceTool.isActive = true
                         addSourceTool.showForm = true
@@ -922,8 +927,9 @@ struct FieldMapView: View {
                 service.createSource(source)
                 addSourceTool.activeSourceId = source.id
             }
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            mapRefreshTrigger += 1
+                addSourceTool.refreshVertexCount()
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                mapRefreshTrigger += 1
             
         } else {
             let source = PendingSource(
@@ -945,28 +951,32 @@ struct FieldMapView: View {
     }
     
     private func finishMultiPointSource() {
-        addSourceTool.reset()
-        activeTool = .none
-        mapRefreshTrigger += 1
-        UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
-    }
-    
-    private func undoLastAddSourceVertex() {
-        guard let sourceId = addSourceTool.activeSourceId else { return }
-        if AddSourceService.shared.undoLastVertex(sourceId: sourceId) {
+            // Set activeTool FIRST — the context strip checks
+            // `activeTool == .addSource && addSourceTool.isArmed`
+            // so killing activeTool first prevents any partial-state frames
+            activeTool = .none
+            addSourceTool.reset()
             mapRefreshTrigger += 1
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
         }
-    }
-    
-    private func cancelAddSource() {
-        if let sourceId = addSourceTool.activeSourceId {
-            AddSourceService.shared.deleteSource(sourceId)
+        
+        private func undoLastAddSourceVertex() {
+            guard let sourceId = addSourceTool.activeSourceId else { return }
+            if AddSourceService.shared.undoLastVertex(sourceId: sourceId) {
+                addSourceTool.refreshVertexCount()
+                mapRefreshTrigger += 1
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            }
         }
-        addSourceTool.reset()
-        activeTool = .none
-        mapRefreshTrigger += 1
-    }
+        
+        private func cancelAddSource() {
+            if let sourceId = addSourceTool.activeSourceId {
+                AddSourceService.shared.deleteSource(sourceId)
+            }
+            activeTool = .none
+            addSourceTool.reset()
+            mapRefreshTrigger += 1
+        }
 }
 
 // MARK: - Spatial Map View (with layer rendering + navigation)
@@ -1531,6 +1541,10 @@ struct SpatialMapView: UIViewRepresentable {
                 
                 if coords.count >= 2 {
                     var lineCoords = coords
+                    // Auto-close polygon shapes so tech sees the actual boundary
+                    if source.sourceType == .polygon && coords.count >= 3 {
+                        lineCoords.append(coords[0])
+                }
                     let polyline = MKPolyline(coordinates: &lineCoords, count: lineCoords.count)
                     polyline.title = "PENDING_VERTICES_\(source.id)"
                     mapView.addOverlay(polyline, level: .aboveLabels)
