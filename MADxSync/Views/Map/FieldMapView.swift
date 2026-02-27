@@ -408,6 +408,49 @@ struct FieldMapView: View {
                 }
             }
             
+            // 2b. Pending polyline snap — if not already matched
+            if featureId == nil && layerVisibility.showPendingSources {
+                let pendingPolylines = AddSourceService.shared.sources.filter {
+                    $0.sourceType == .polyline && $0.allCoordinates.count >= 2
+                }
+                for source in pendingPolylines {
+                    let coords = source.allCoordinates
+                    var bestDist = Double.greatestFiniteMagnitude
+                    var bestProjected: CLLocationCoordinate2D? = nil
+                    
+                    for i in 0..<(coords.count - 1) {
+                        let ap = (coordinate.latitude - coords[i].latitude,
+                                  coordinate.longitude - coords[i].longitude)
+                        let ab = (coords[i+1].latitude - coords[i].latitude,
+                                  coords[i+1].longitude - coords[i].longitude)
+                        let ab2 = ab.0 * ab.0 + ab.1 * ab.1
+                        guard ab2 > 0 else { continue }
+                        let t = max(0, min(1, (ap.0 * ab.0 + ap.1 * ab.1) / ab2))
+                        let proj = CLLocationCoordinate2D(
+                            latitude: coords[i].latitude + t * ab.0,
+                            longitude: coords[i].longitude + t * ab.1
+                        )
+                        let dist = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+                            .distance(from: CLLocation(latitude: proj.latitude, longitude: proj.longitude))
+                        if dist < bestDist { bestDist = dist; bestProjected = proj }
+                    }
+                    
+                    // ~111 meters tolerance (matches production polyline snap)
+                    if bestDist <= 111, let snapped = bestProjected {
+                        finalCoordinate = snapped
+                        featureId = source.id
+                        featureType = "pending_polyline"
+                        snapSourceName = source.displayName
+                        withAnimation(.easeOut(duration: 0.2)) { showSnapToast = true }
+                        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            withAnimation(.easeIn(duration: 0.2)) { showSnapToast = false }
+                        }
+                        break
+                    }
+                }
+            }
+            
             // 3. Polygon / other hit test — if still no feature matched
             if featureId == nil {
                 let hitFeature = SpatialHitTester.hitTest(
@@ -424,6 +467,39 @@ struct FieldMapView: View {
                     case .polyline(let p): featureId = p.id; featureType = "polyline"
                     case .pointSite(let s): featureId = s.id; featureType = "pointsite"
                     case .stormDrain(let d): featureId = d.id; featureType = "stormdrain"
+                    }
+                }
+            }
+            
+            // 3b. Pending polygon hit-test
+            if featureId == nil && layerVisibility.showPendingSources {
+                let pendingPolygons = AddSourceService.shared.sources.filter {
+                    $0.sourceType == .polygon && $0.allCoordinates.count >= 3
+                }
+                for source in pendingPolygons {
+                    let coords = source.allCoordinates
+                    var inside = false
+                    let count = coords.count
+                    var j = count - 1
+                    for i in 0..<count {
+                        let pi = coords[i]; let pj = coords[j]
+                        if ((pi.latitude > coordinate.latitude) != (pj.latitude > coordinate.latitude)) &&
+                            (coordinate.longitude < (pj.longitude - pi.longitude) *
+                             (coordinate.latitude - pi.latitude) / (pj.latitude - pi.latitude) + pi.longitude) {
+                            inside = !inside
+                        }
+                        j = i
+                    }
+                    if inside {
+                        featureId = source.id
+                        featureType = "pending_polygon"
+                        snapSourceName = source.displayName
+                        withAnimation(.easeOut(duration: 0.2)) { showSnapToast = true }
+                        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            withAnimation(.easeIn(duration: 0.2)) { showSnapToast = false }
+                        }
+                        break
                     }
                 }
             }
@@ -1529,24 +1605,28 @@ struct SpatialMapView: UIViewRepresentable {
                 let coords = source.allCoordinates
                 guard !coords.isEmpty else { continue }
                 
+                // Get treatment color for this pending source
+                let sourceColor = statusService.colorForFeature(source.id)
+
                 for (index, coord) in coords.enumerated() {
                     let annotation = PendingVertexAnnotation(
                         coordinate: coord,
                         vertexNumber: index + 1,
                         sourceId: source.id,
-                        sourceType: source.sourceType
+                        sourceType: source.sourceType,
+                        colorHex: sourceColor  // Pass treatment color
                     )
                     mapView.addAnnotation(annotation)
                 }
-                
+
                 if coords.count >= 2 {
                     var lineCoords = coords
-                    // Auto-close polygon shapes so tech sees the actual boundary
                     if source.sourceType == .polygon && coords.count >= 3 {
                         lineCoords.append(coords[0])
-                }
+                    }
                     let polyline = MKPolyline(coordinates: &lineCoords, count: lineCoords.count)
-                    polyline.title = "PENDING_VERTICES_\(source.id)"
+                    // Encode both source ID and color in the title for the renderer
+                    polyline.title = "PENDING_VERTICES_\(source.id)_COLOR_\(sourceColor)"
                     mapView.addOverlay(polyline, level: .aboveLabels)
                 }
             }
@@ -1693,21 +1773,30 @@ struct SpatialMapView: UIViewRepresentable {
                 return ServiceRequestPulseRenderer(overlay: srOverlay)
             }
             
-            // Pending source vertex connecting lines (dotted)
-            if let polyline = overlay as? MKPolyline,
-               let title = polyline.title, title.hasPrefix("PENDING_VERTICES_") {
-                let r = MKPolylineRenderer(polyline: polyline)
-                r.strokeColor = UIColor.systemTeal.withAlphaComponent(0.6)
-                r.lineWidth = 2
-                r.lineDashPattern = [8, 6]
-                return r
-            }
-            
             if let polygon = overlay as? MKPolygon, polygon.title == "SELECTED_FIELD" {
                 let r = MKPolygonRenderer(polygon: polygon)
                 r.strokeColor = UIColor.systemYellow
                 r.fillColor = UIColor.systemYellow.withAlphaComponent(0.25)
                 r.lineWidth = 3
+                return r
+            }
+            
+            // Pending source vertex connecting lines (dotted)
+            if let polyline = overlay as? MKPolyline,
+               let title = polyline.title, title.hasPrefix("PENDING_VERTICES_") {
+                let r = MKPolylineRenderer(polyline: polyline)
+                // Extract color from title: PENDING_VERTICES_{id}_COLOR_{hex}
+                if let colorRange = title.range(of: "_COLOR_") {
+                    let hex = String(title[colorRange.upperBound...])
+                    let isTreated = hex != TreatmentColors.never
+                    r.strokeColor = UIColor(hexString: hex).withAlphaComponent(isTreated ? 0.8 : 0.6)
+                    r.lineWidth = isTreated ? 3 : 2
+                    r.lineDashPattern = isTreated ? nil : [8, 6]
+                } else {
+                    r.strokeColor = UIColor.systemTeal.withAlphaComponent(0.6)
+                    r.lineWidth = 2
+                    r.lineDashPattern = [8, 6]
+                }
                 return r
             }
             if let polyline = overlay as? MKPolyline, polyline.title == "ROUTE" {

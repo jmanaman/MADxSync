@@ -610,7 +610,12 @@ class TreatmentStatusService: ObservableObject {
         case "field": return "polygon"
         case "polyline": return "polyline"
         case "pointsite": return "pointsite"
-        case "stormdrain": return "pointsite"  // Storm drains use pointsite in source_notes
+        case "stormdrain": return "pointsite"
+        // Pending sources map to same source_notes types
+        case "pending_polygon": return "polygon"
+        case "pending_polyline": return "polyline"
+        case "pending_pointsite": return "pointsite"
+        case "pending_stormdrain": return "pointsite"
         default: return featureType
         }
     }

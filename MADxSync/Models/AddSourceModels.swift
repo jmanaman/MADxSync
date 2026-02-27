@@ -122,7 +122,7 @@ struct PendingSource: Codable, Identifiable {
         geometry: PendingSourceGeometry,
         createdBy: String
     ) {
-        self.id = UUID().uuidString
+        self.id = UUID().uuidString.lowercased()
         self.districtId = districtId
         self.sourceType = sourceType
         self.name = name
@@ -333,30 +333,35 @@ class PendingVertexAnnotation: NSObject, MKAnnotation {
     let vertexNumber: Int
     let sourceId: String
     let sourceType: AddSourceType
+    let colorHex: String 
     
-    var title: String? { "\(vertexNumber)" }
-    
-    init(coordinate: CLLocationCoordinate2D, vertexNumber: Int, sourceId: String, sourceType: AddSourceType) {
+    init(coordinate: CLLocationCoordinate2D, vertexNumber: Int,
+         sourceId: String, sourceType: AddSourceType,
+         colorHex: String = "#14b8a6") {  // Default teal
         self.coordinate = coordinate
         self.vertexNumber = vertexNumber
         self.sourceId = sourceId
         self.sourceType = sourceType
+        self.colorHex = colorHex
     }
     
+    // Update markerImage to use colorHex instead of hardcoded teal
     var markerImage: UIImage {
-        let size = CGSize(width: 28, height: 28)
+        let size = CGSize(width: 24, height: 24)
         let renderer = UIGraphicsImageRenderer(size: size)
         return renderer.image { context in
             let ctx = context.cgContext
-            UIColor.systemTeal.setFill()
+            let color = UIColor(hexString: colorHex)
+            color.setFill()
             UIColor.white.setStroke()
             ctx.setLineWidth(2)
-            ctx.fillEllipse(in: CGRect(x: 2, y: 2, width: 24, height: 24))
-            ctx.strokeEllipse(in: CGRect(x: 2, y: 2, width: 24, height: 24))
+            ctx.fillEllipse(in: CGRect(x: 2, y: 2, width: 20, height: 20))
+            ctx.strokeEllipse(in: CGRect(x: 2, y: 2, width: 20, height: 20))
             
+            // Draw vertex number
             let text = "\(vertexNumber)" as NSString
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.boldSystemFont(ofSize: 12),
+                .font: UIFont.boldSystemFont(ofSize: 11),
                 .foregroundColor: UIColor.white
             ]
             let textSize = text.size(withAttributes: attrs)
