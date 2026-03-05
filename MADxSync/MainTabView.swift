@@ -1,4 +1,6 @@
 import SwiftUI
+import MapKit
+import MapCache
 
 /// Main tab view for MADx iOS app
 struct MainTabView: View {
@@ -151,7 +153,7 @@ struct SettingsView: View {
                             HStack {
                                 ProgressView()
                                     .padding(.trailing, 8)
-                                Text("Downloading Tulare County...")
+                                Text("Downloading District Map...")
                             }
                             ProgressView(value: downloadProgress)
                                 .progressViewStyle(.linear)
@@ -166,8 +168,8 @@ struct SettingsView: View {
                                 Image(systemName: "arrow.down.circle")
                                     .foregroundColor(.blue)
                                 VStack(alignment: .leading) {
-                                    Text("Download Tulare County")
-                                    Text("~50-100 MB • Requires WiFi")
+                                    Text("Download District Map")
+                                    Text("~30-80 MB • Requires WiFi")
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
@@ -188,7 +190,7 @@ struct SettingsView: View {
                             HStack {
                                 Image(systemName: "checkmark.circle.fill")
                                     .foregroundColor(.green)
-                                Text("Tulare County maps cached!")
+                                Text("District map cached for offline use!")
                                     .foregroundColor(.green)
                             }
                         }
@@ -335,10 +337,12 @@ struct SettingsView: View {
         isDownloadingMaps = true
         downloadProgress = 0
         
-        let minLat = 35.7
-        let maxLat = 36.7
-        let minLon = -119.9
-        let maxLon = -118.7
+        // TMAD district boundary bounding box (from spatial data)
+        // Padded slightly (~0.01°) so edges aren't cut off
+        let minLat = 35.78
+        let maxLat = 36.34
+        let minLon = -119.55
+        let maxLon = -119.06
         
         Task {
             do {
@@ -365,12 +369,21 @@ struct SettingsView: View {
         }
     }
     
+    /// Downloads map tiles directly into MapCache's DiskCache so the map
+    /// can read them offline. Uses the SAME url template and config as
+    /// FieldMapView so cache keys match exactly.
     private func downloadMapTiles(minLat: Double, maxLat: Double, minLon: Double, maxLon: Double, minZoom: Int, maxZoom: Int) async throws {
-        let urlTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        
+        // CRITICAL: Use the SAME url template as FieldMapView's MapCache config
+        // The {s} subdomain is part of the cache key — must match exactly
+        let config = MapCacheConfig(withUrlTemplate: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png")
+        let mapCache = MapCache(withConfig: config)
         
         var totalTiles = 0
         var downloadedTiles = 0
+        var failedTiles = 0
         
+        // Count total tiles first for progress bar
         for zoom in minZoom...maxZoom {
             let minTileX = lonToTileX(minLon, zoom: zoom)
             let maxTileX = lonToTileX(maxLon, zoom: zoom)
@@ -378,6 +391,8 @@ struct SettingsView: View {
             let maxTileY = latToTileY(minLat, zoom: zoom)
             totalTiles += (maxTileX - minTileX + 1) * (maxTileY - minTileY + 1)
         }
+        
+        print("[OfflineMap] Starting download: \(totalTiles) tiles, zoom \(minZoom)-\(maxZoom)")
         
         for zoom in minZoom...maxZoom {
             let minTileX = lonToTileX(minLon, zoom: zoom)
@@ -387,14 +402,20 @@ struct SettingsView: View {
             
             for x in minTileX...maxTileX {
                 for y in minTileY...maxTileY {
-                    let urlString = urlTemplate
-                        .replacingOccurrences(of: "{z}", with: "\(zoom)")
-                        .replacingOccurrences(of: "{x}", with: "\(x)")
-                        .replacingOccurrences(of: "{y}", with: "\(y)")
+                    // Build MKTileOverlayPath — this is what MapCache uses as its cache key
+                    let path = MKTileOverlayPath(x: x, y: y, z: zoom, contentScaleFactor: 2.0)
                     
-                    if let url = URL(string: urlString) {
-                        let request = URLRequest(url: url)
-                        let _ = try? await URLSession.shared.data(for: request)
+                    // Use MapCache's own loadTile — it fetches from network AND
+                    // stores into DiskCache automatically. When the map later
+                    // requests this tile, it finds it already cached.
+                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                        mapCache.loadTile(at: path) { data, error in
+                            if let error = error {
+                                print("[OfflineMap] Tile \(zoom)/\(x)/\(y) failed: \(error.localizedDescription)")
+                                failedTiles += 1
+                            }
+                            continuation.resume()
+                        }
                     }
                     
                     downloadedTiles += 1
@@ -402,10 +423,17 @@ struct SettingsView: View {
                     await MainActor.run {
                         self.downloadProgress = progress
                     }
-                    try await Task.sleep(nanoseconds: 50_000_000)
+                    
+                    // Small delay to avoid hammering OSM servers (they rate limit)
+                    // 10ms is fast enough for bulk download but respectful
+                    try await Task.sleep(nanoseconds: 10_000_000)
                 }
             }
+            
+            print("[OfflineMap] Zoom \(zoom) complete (\(downloadedTiles)/\(totalTiles))")
         }
+        
+        print("[OfflineMap] Download complete. \(downloadedTiles - failedTiles)/\(totalTiles) tiles cached, \(failedTiles) failed")
     }
     
     private func lonToTileX(_ lon: Double, zoom: Int) -> Int {
@@ -418,11 +446,22 @@ struct SettingsView: View {
     }
     
     private func clearMapCache() {
-        URLCache.shared.removeAllCachedResponses()
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
-        if let mapCacheDir = cacheDir?.appendingPathComponent("MapCache") {
-            try? FileManager.default.removeItem(at: mapCacheDir)
+        // Clear MapCache's DiskCache (where tiles are actually stored)
+        let config = MapCacheConfig(withUrlTemplate: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png")
+        let mapCache = MapCache(withConfig: config)
+        mapCache.clear {
+            print("[OfflineMap] MapCache cleared")
         }
+        
+        // Also clear URLCache just in case
+        URLCache.shared.removeAllCachedResponses()
+        
+        // Clean up legacy cache directory if it exists
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+        if let diskCacheDir = cacheDir?.appendingPathComponent("DiskCache") {
+            try? FileManager.default.removeItem(at: diskCacheDir)
+        }
+        
         showDownloadComplete = false
         let impact = UIImpactFeedbackGenerator(style: .medium)
         impact.impactOccurred()

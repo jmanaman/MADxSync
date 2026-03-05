@@ -240,7 +240,16 @@ struct FieldMapView: View {
                 }
             }
             
+            // Start periodic spatial refresh (picks up Hub edits, promotes, deletes)
+            spatialService.startPeriodicRefresh()
+            
             Task {
+                await treatmentStatusService.syncFromHub()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            Task {
+                await spatialService.refreshQuietly()
                 await treatmentStatusService.syncFromHub()
             }
         }
@@ -1078,6 +1087,10 @@ struct SpatialMapView: UIViewRepresentable {
         mapView.delegate = context.coordinator
         mapView.showsUserLocation = false
         mapView.setRegion(region, animated: false)
+        
+        // Prevent black screen when tiles fail to load (dark mode + no cache + no network)
+        // Shows a neutral grey instead of black void
+        mapView.backgroundColor = UIColor.systemGray5
         
         let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
         mapView.addGestureRecognizer(tapGesture)

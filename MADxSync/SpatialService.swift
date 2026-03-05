@@ -5,6 +5,8 @@
 //  Fetches spatial data from Supabase with local caching
 //
 //  HARDENED: 2026-02-09 — Network guard on loadAllLayers, skips when offline.
+//  UPDATED:  2026-02-28 — Periodic refresh (5 min) + foreground refresh so Hub edits
+//            (promotes, geometry edits, name changes) appear without app restart.
 //
 
 import Foundation
@@ -24,6 +26,10 @@ class SpatialService: ObservableObject {
     @Published var isLoading = false
     @Published var lastError: String?
     @Published var lastSync: Date?
+    
+    // MARK: - Refresh Timer
+    private var refreshTimer: Timer?
+    private let refreshInterval: TimeInterval = 300  // 5 minutes — matches Hub refresh
     
     // MARK: - Configuration
     private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
@@ -52,7 +58,56 @@ class SpatialService: ObservableObject {
         loadFromCache()
     }
     
-    // MARK: - Load All Layers
+    // MARK: - Start Periodic Refresh
+    // Call this once from FieldMapView.onAppear after initial load
+    
+    func startPeriodicRefresh() {
+        // Don't double-start
+        guard refreshTimer == nil else { return }
+        
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                // Silent refresh — no loading spinner for background updates
+                await self.refreshQuietly()
+            }
+        }
+        
+        print("[SpatialService] Periodic refresh started (every \(Int(refreshInterval))s)")
+    }
+    
+    func stopPeriodicRefresh() {
+        refreshTimer?.invalidate()
+        refreshTimer = nil
+    }
+    
+    // MARK: - Quiet Refresh (no loading spinner, no clearing data on empty)
+    // Used for periodic and foreground refreshes — doesn't flash the UI
+    
+    func refreshQuietly() async {
+        guard NetworkMonitor.shared.hasInternet else { return }
+        guard !isLoading else { return }  // Don't overlap with a full load
+        
+        async let f = fetchFields()
+        async let p = fetchPolylines()
+        async let ps = fetchPointSites()
+        async let sd = fetchStormDrains()
+        
+        let results = await (f, p, ps, sd)
+        
+        // Only update if we got data — never blank out on transient errors
+        if !results.0.0.isEmpty { fields = results.0.0 }
+        if !results.1.0.isEmpty { polylines = results.1.0 }
+        if !results.2.0.isEmpty { pointSites = results.2.0 }
+        if !results.3.0.isEmpty { stormDrains = results.3.0 }
+        
+        lastSync = Date()
+        saveToCache()
+        
+        print("[SpatialService] Quiet refresh: \(fields.count) fields, \(polylines.count) polylines, \(pointSites.count) point sites, \(stormDrains.count) storm drains")
+    }
+    
+    // MARK: - Load All Layers (full initial load)
     
     func loadAllLayers() async {
         // Network guard — don't fire doomed requests when offline.
