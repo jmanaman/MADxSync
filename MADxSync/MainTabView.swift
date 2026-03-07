@@ -337,12 +337,21 @@ struct SettingsView: View {
         isDownloadingMaps = true
         downloadProgress = 0
         
-        // TMAD district boundary bounding box (from spatial data)
-        // Padded slightly (~0.01°) so edges aren't cut off
-        let minLat = 35.78
-        let maxLat = 36.34
-        let minLon = -119.55
-        let maxLon = -119.06
+        // Compute bounding box dynamically from district boundary geometry
+        // Works for ANY district — no hardcoded coordinates
+        let bbox = computeDistrictBoundingBox()
+        
+        guard let bbox = bbox else {
+            isDownloadingMaps = false
+            downloadError = "No district boundary loaded. Open the map first, then try again."
+            return
+        }
+        
+        // Pad slightly (~0.01°) so edges aren't cut off
+        let minLat = bbox.minLat - 0.01
+        let maxLat = bbox.maxLat + 0.01
+        let minLon = bbox.minLon - 0.01
+        let maxLon = bbox.maxLon + 0.01
         
         Task {
             do {
@@ -465,6 +474,48 @@ struct SettingsView: View {
         showDownloadComplete = false
         let impact = UIImpactFeedbackGenerator(style: .medium)
         impact.impactOccurred()
+    }
+    
+    /// Compute bounding box from district boundary geometry.
+    /// Works for any district — reads from SpatialService which pulls from Supabase.
+    private func computeDistrictBoundingBox() -> (minLat: Double, maxLat: Double, minLon: Double, maxLon: Double)? {
+        let boundaries = SpatialService.shared.boundaries
+        guard !boundaries.isEmpty else { return nil }
+        
+        var minLat = Double.greatestFiniteMagnitude
+        var maxLat = -Double.greatestFiniteMagnitude
+        var minLon = Double.greatestFiniteMagnitude
+        var maxLon = -Double.greatestFiniteMagnitude
+        
+        for boundary in boundaries {
+            let coords: [CLLocationCoordinate2D]
+            
+            switch boundary.geometry {
+            case .polygon(let poly):
+                coords = poly.outerRing
+            case .multiLineString(let multi):
+                coords = multi.lines.flatMap { $0 }
+            case .lineString(let line):
+                coords = line.coordinates2D
+            case .multiPolygon(let multi):
+                coords = multi.polygons.flatMap { $0 }
+            default:
+                continue
+            }
+            
+            for coord in coords {
+                if coord.latitude < minLat { minLat = coord.latitude }
+                if coord.latitude > maxLat { maxLat = coord.latitude }
+                if coord.longitude < minLon { minLon = coord.longitude }
+                if coord.longitude > maxLon { maxLon = coord.longitude }
+            }
+        }
+        
+        // Sanity check — make sure we got valid bounds
+        guard minLat < maxLat, minLon < maxLon else { return nil }
+        
+        print("[OfflineMap] District bbox: \(minLat),\(minLon) → \(maxLat),\(maxLon)")
+        return (minLat, maxLat, minLon, maxLon)
     }
 }
 

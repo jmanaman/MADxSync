@@ -29,7 +29,7 @@ class SpatialService: ObservableObject {
     
     // MARK: - Refresh Timer
     private var refreshTimer: Timer?
-    private let refreshInterval: TimeInterval = 300  // 5 minutes — matches Hub refresh
+    private let refreshInterval: TimeInterval = 3600  // 1 hour — matches Hub refresh
     
     // MARK: - Configuration
     private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"

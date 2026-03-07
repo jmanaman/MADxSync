@@ -1088,10 +1088,6 @@ struct SpatialMapView: UIViewRepresentable {
         mapView.showsUserLocation = false
         mapView.setRegion(region, animated: false)
         
-        // Prevent black screen when tiles fail to load (dark mode + no cache + no network)
-        // Shows a neutral grey instead of black void
-        mapView.backgroundColor = UIColor.systemGray5
-        
         let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap(_:)))
         mapView.addGestureRecognizer(tapGesture)
         
@@ -1967,9 +1963,14 @@ enum SelectedFeature {
 struct FeatureInfoView: View {
     let feature: SelectedFeature
     @ObservedObject var treatmentStatusService = TreatmentStatusService.shared
+    @ObservedObject var workingNotesService = WorkingNotesService.shared
+    @ObservedObject var sourceNotesService = SourceNotesService.shared
     @Environment(\.dismiss) var dismiss
     @State private var showCycleConfirm = false
     @State private var pendingCycleDays: Int = 7
+    @State private var workingNoteText: String = ""
+    @State private var isSavingNote = false
+    @State private var showNoteSaved = false
     
     /// Feature identifiers extracted once
     private var featureId: String {
@@ -1994,7 +1995,9 @@ struct FeatureInfoView: View {
         NavigationView {
             List {
                 treatmentStatusSection
+                sourceNotesSection
                 cycleDaysSection
+                workingNoteSection
                 
                 switch feature {
                 case .field(let field): fieldInfo(field)
@@ -2010,6 +2013,14 @@ struct FeatureInfoView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .onAppear {
+                // Load existing note into text field
+                if let note = workingNotesService.getNote(sourceType: featureType, sourceId: featureId) {
+                    workingNoteText = note.noteText
+                } else {
+                    workingNoteText = ""
+                }
+            }
             .alert("Change Cycle?", isPresented: $showCycleConfirm) {
                 Button("Set to \(pendingCycleDays) days", role: .none) {
                     applyCycleChange(pendingCycleDays)
@@ -2017,6 +2028,42 @@ struct FeatureInfoView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("This source will rotate green → yellow → orange → red over \(pendingCycleDays) days instead of \(treatmentStatusService.statusForFeature(featureId).cycleDays) days.")
+            }
+        }
+    }
+    
+    // MARK: - Permanent Source Notes (read-only from app)
+    
+    @ViewBuilder private var sourceNotesSection: some View {
+        let notes = sourceNotesService.getNotesForSource(sourceType: featureType, sourceId: featureId)
+        
+        if !notes.isEmpty {
+            Section {
+                ForEach(notes) { note in
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(note.note ?? "")
+                            .font(.body)
+                        
+                        HStack(spacing: 8) {
+                            if let createdBy = note.createdBy {
+                                Text(createdBy)
+                                    .font(.caption)
+                                    .foregroundColor(.orange)
+                            }
+                            if let createdAt = note.createdAt {
+                                Text(sourceNotesService.formatTimestamp(createdAt))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            } header: {
+                Text("📌 Source Notes")
+            } footer: {
+                Text("Permanent notes attached to this source. Managed by the OD on the Hub.")
+                    .font(.caption2)
             }
         }
     }
@@ -2108,6 +2155,143 @@ struct FeatureInfoView: View {
             // Haptic feedback
             let impact = UIImpactFeedbackGenerator(style: .medium)
             impact.impactOccurred()
+        }
+    }
+    
+    // MARK: - Working Note Section (Field Discussion Tool)
+    
+    @ViewBuilder private var workingNoteSection: some View {
+        let existingNote = workingNotesService.getNote(sourceType: featureType, sourceId: featureId)
+        let hasNote = existingNote != nil && !(existingNote?.noteText.isEmpty ?? true)
+        
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: "bubble.left.and.bubble.right.fill")
+                        .foregroundColor(.orange)
+                    Text("Discussion Note")
+                        .font(.subheadline.bold())
+                    Spacer()
+                    if isSavingNote {
+                        ProgressView()
+                            .scaleEffect(0.7)
+                    }
+                }
+                
+                // Timestamps
+                if let note = existingNote {
+                    HStack(spacing: 12) {
+                        if !note.updatedAt.isEmpty {
+                            Text("Updated: \(workingNotesService.formatTimestamp(note.updatedAt))")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
+                    }
+                }
+                
+                // Editable text field
+                TextEditor(text: $workingNoteText)
+                    .frame(minHeight: 80)
+                    .padding(4)
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(8)
+                    .overlay(
+                        Group {
+                            if workingNoteText.isEmpty {
+                                Text("Start a discussion note...")
+                                    .foregroundColor(.secondary)
+                                    .padding(.leading, 8)
+                                    .padding(.top, 12)
+                                    .allowsHitTesting(false)
+                            }
+                        }, alignment: .topLeading
+                    )
+                
+                if let note = existingNote, !note.createdAt.isEmpty {
+                    Text("Started: \(workingNotesService.formatTimestamp(note.createdAt))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                
+                // Saved confirmation
+                if showNoteSaved {
+                    HStack {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                        Text("Note saved!")
+                            .font(.subheadline.bold())
+                            .foregroundColor(.green)
+                    }
+                    .transition(.opacity)
+                    .animation(.easeInOut, value: showNoteSaved)
+                }
+                
+                // Action buttons
+                HStack(spacing: 10) {
+                    Button(action: {
+                        guard !workingNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                        isSavingNote = true
+                        Task {
+                            let success = await workingNotesService.save(
+                                sourceType: featureType,
+                                sourceId: featureId,
+                                noteText: workingNoteText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            )
+                            isSavingNote = false
+                            if success {
+                                showNoteSaved = true
+                                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                    showNoteSaved = false
+                                }
+                            }
+                        }
+                    }) {
+                        HStack {
+                            Image(systemName: "checkmark")
+                            Text("Save Note")
+                        }
+                        .font(.subheadline.bold())
+                        .foregroundColor(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(workingNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.gray : Color.orange)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(workingNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSavingNote)
+                    
+                    if hasNote {
+                        Button(action: {
+                            Task {
+                                let success = await workingNotesService.delete(sourceType: featureType, sourceId: featureId)
+                                if success {
+                                    workingNoteText = ""
+                                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                                }
+                            }
+                        }) {
+                            HStack {
+                                Image(systemName: "trash")
+                                Text("Delete")
+                            }
+                            .font(.subheadline.bold())
+                            .foregroundColor(.red)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(Color(.tertiarySystemBackground))
+                            .cornerRadius(8)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+        } header: {
+            Text("💬 Discussion")
+        } footer: {
+            Text("Shared scratchpad for tech-to-tech communication. Edit freely, delete when done.")
+                .font(.caption2)
         }
     }
     

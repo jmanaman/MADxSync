@@ -31,7 +31,7 @@ final class HubSyncService: ObservableObject {
     private let pollInterval: TimeInterval = 60.0
     
     /// Spatial refresh interval. 3600s = once per hour. Heavy pull, rarely changes.
-    private let spatialRefreshInterval: TimeInterval = 300.0
+    private let spatialRefreshInterval: TimeInterval = 3600.0
     
     /// Last spatial refresh time
     private var lastSpatialRefresh: Date?
@@ -101,6 +101,8 @@ final class HubSyncService: ObservableObject {
         Task { await refreshSpatialIfDue() }
         Task { await pullSourceFinderPins() }
         Task { await pullServiceRequests() }
+        Task { await pullWorkingNotes() }
+        Task { await pullSourceNotes() }
     }
     
     // MARK: - Channel: Spatial Layers (Hourly + Promotion Triggered)
@@ -316,6 +318,30 @@ final class HubSyncService: ObservableObject {
         defer { setBusy(channel, false) }
         
         await ServiceRequestService.shared.pullFromHub()
+        recordSuccess(channel)
+    }
+    
+    // MARK: - Channel: Working Notes (Field Discussion Tool)
+    
+    private func pullWorkingNotes() async {
+        let channel = "workingNotes"
+        guard !isBusy(channel) else { return }
+        setBusy(channel, true)
+        defer { setBusy(channel, false) }
+        
+        await WorkingNotesService.shared.pullFromHub()
+        recordSuccess(channel)
+    }
+    
+    // MARK: - Channel: Source Notes (Permanent Notes)
+    
+    private func pullSourceNotes() async {
+        let channel = "sourceNotes"
+        guard !isBusy(channel) else { return }
+        setBusy(channel, true)
+        defer { setBusy(channel, false) }
+        
+        await SourceNotesService.shared.pullFromHub()
         recordSuccess(channel)
     }
     
