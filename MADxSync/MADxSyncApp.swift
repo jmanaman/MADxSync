@@ -22,6 +22,8 @@ import UIKit
 struct MADxSyncApp: App {
     @StateObject private var authService = AuthService.shared
     @StateObject private var truckService = TruckService.shared
+    @StateObject private var equipmentService = EquipmentService.shared
+    @StateObject private var positionService = PositionService.shared
     @StateObject private var networkMonitor = NetworkMonitor.shared
     @Environment(\.scenePhase) private var scenePhase
     
@@ -42,6 +44,8 @@ struct MADxSyncApp: App {
             RootView()
                 .environmentObject(authService)
                 .environmentObject(truckService)
+                .environmentObject(equipmentService)
+                .environmentObject(positionService)
                 .environmentObject(networkMonitor)
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
@@ -113,6 +117,8 @@ struct MADxSyncApp: App {
 struct RootView: View {
     @EnvironmentObject var authService: AuthService
     @EnvironmentObject var truckService: TruckService
+    @EnvironmentObject var equipmentService: EquipmentService
+    @EnvironmentObject var positionService: PositionService
     @EnvironmentObject var networkMonitor: NetworkMonitor
     
     /// Whether any network banner is currently showing
@@ -142,15 +148,15 @@ struct RootView: View {
             Group {
                 if !authService.isAuthenticated {
                     LoginView()
-                } else if !truckService.hasTruckSelected {
-                    TruckPickerView()
+                } else if !equipmentService.hasEquipmentSelected {
+                    EquipmentPickerView()
                 } else {
                     MainTabView()
                 }
             }
             .frame(maxHeight: .infinity)
             .animation(.easeInOut, value: authService.isAuthenticated)
-            .animation(.easeInOut, value: truckService.hasTruckSelected)
+            .animation(.easeInOut, value: equipmentService.hasEquipmentSelected)
         }
         .animation(.easeInOut(duration: 0.3), value: networkMonitor.hasInternet)
         .animation(.easeInOut(duration: 0.3), value: networkMonitor.isFLOWiFi)

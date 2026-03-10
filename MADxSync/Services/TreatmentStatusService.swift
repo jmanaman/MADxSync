@@ -39,6 +39,7 @@ struct TreatmentColors {
     static let aging   = "#ffa500"   // Orange - almost due
     static let overdue = "#ff4444"   // Red - overdue
     static let never   = "#ff0000"   // Red - never treated
+    static let indefinite = "#888888" // Grey - pushed off indefinitely
     
     static let fillOpacity: Float = 0.5
 }
@@ -103,6 +104,11 @@ class TreatmentStatusService: ObservableObject {
     
     /// Returns the display color for a feature, considering local overrides
     func colorForFeature(_ featureId: String) -> String {
+        // Indefinite push-off overrides EVERYTHING — stays grey even if treated
+        if let status = statusByFeature[featureId], status.cycle_days >= 9999 {
+            return TreatmentColors.indefinite
+        }
+        
         // Local override takes priority (optimistic update)
         if let local = localOverrides[featureId] {
             // Check if local override has aged out (Hub should have picked it up by now)
@@ -128,6 +134,20 @@ class TreatmentStatusService: ObservableObject {
     
     /// Returns the full status info for a feature (for popup display)
     func statusForFeature(_ featureId: String) -> FeatureStatusInfo {
+        // Indefinite push-off overrides EVERYTHING — stays grey even if treated
+        if let status = statusByFeature[featureId], status.cycle_days >= 9999 {
+            return FeatureStatusInfo(
+                color: TreatmentColors.indefinite,
+                statusText: "Pushed Off (Indefinite)",
+                daysSince: status.days_since,
+                lastTreated: status.last_treated.flatMap { ISO8601DateFormatter().date(from: $0) },
+                lastTreatedBy: status.last_treated_by,
+                lastChemical: status.last_chemical,
+                cycleDays: status.cycle_days,
+                isLocalOverride: false
+            )
+        }
+        
         // Local override
         if let local = localOverrides[featureId] {
             let hoursSince = Date().timeIntervalSince(local.treatedAt) / 3600
@@ -624,6 +644,9 @@ class TreatmentStatusService: ObservableObject {
 
     /// Recalculate color using proportional thresholds — MUST match Hub's Utils.getTreatmentColor
     private func recalculateColor(daysSince: Int?, cycleDays: Int) -> String {
+        // Indefinite push-off — source is shelved, show grey
+        if cycleDays >= 9999 { return TreatmentColors.indefinite }
+        
         guard let days = daysSince else { return TreatmentColors.never }
         
         let cycle = max(cycleDays, 1)
@@ -638,6 +661,9 @@ class TreatmentStatusService: ObservableObject {
 
     /// Recalculate status text — MUST match Hub's Utils.getTreatmentStatus
     private func recalculateStatusText(daysSince: Int?, cycleDays: Int) -> String {
+        // Indefinite push-off
+        if cycleDays >= 9999 { return "Pushed Off (Indefinite)" }
+        
         guard let days = daysSince else { return "Never Treated" }
         
         let cycle = max(cycleDays, 1)

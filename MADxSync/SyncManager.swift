@@ -4,6 +4,18 @@
 //
 //  Created by Justin Manning on 1/29/26.
 //
+//  FIXED: 2026-03-06 — FLO communication now delegates to FLOService exclusively.
+//  Previously, sync() used its own URLSession.shared calls to fetch the daylog
+//  file list, download CSVs, and clear downloaded files. URLSession.shared routes
+//  over whatever interface iOS prefers — which is LTE when iOS enables it alongside
+//  FLO WiFi (because FLO has no internet). This caused silent download failures
+//  in the field: the sync appeared to run but downloaded nothing.
+//
+//  Fix: replaced getFileList(), downloadFile(), and clearDownloaded() with calls
+//  to FLOService.fetchDaylogList(), FLOService.downloadDaylog(), and
+//  FLOService.clearDownloadedFiles(). FLOService uses a WiFi-pinned URLSession
+//  (allowsCellularAccess = false) that always reaches 192.168.4.1 regardless of
+//  iOS routing preferences. Also removed the now-redundant FLOFile struct.
 
 import SwiftUI
 import Combine
@@ -22,7 +34,7 @@ class SyncManager: ObservableObject {
     @Published var logText = "Ready.\nConnect to FLO WiFi to download."
     
     // MARK: - Configuration
-    private let floBaseURL = "http://192.168.4.1"
+    // NOTE: floBaseURL removed — all FLO communication now goes through FLOService.
     private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
     private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
     
@@ -117,68 +129,37 @@ class SyncManager: ObservableObject {
     }
     
     private func checkFLO() async {
-        guard let url = URL(string: "\(floBaseURL)/identity") else {
-            floConnected = false
-            floStatus = "Invalid URL"
-            return
-        }
+        // Delegate to FLOService — it owns the WiFi-pinned session and identity check.
+        // We just mirror its connected state here for the SyncView UI.
+        await FLOService.shared.fetchIdentity()
         
-        do {
-            let config = URLSessionConfiguration.default
-            config.timeoutIntervalForRequest = 2  // Fast timeout for polling
-            let session = URLSession(configuration: config)
-            
-            let (data, response) = try await session.data(from: url)
-            
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else {
-                if floConnected {
-                    // Was connected, now lost connection
-                    log("📡 FLO disconnected")
-                }
-                floConnected = false
-                floStatus = "Not connected"
-                truckName = nil
-                return
-            }
-            
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let ssid = json["ssid"] as? String {
-                
-                if !floConnected {
-                    // Just connected
-                    log("📡 Connected to FLO: \(ssid)")
-                }
-                
-                floConnected = true
-                truckName = ssid
-                floStatus = "Connected"
-            } else {
-                floConnected = true
-                floStatus = "Connected (unknown)"
-            }
-            
-        } catch {
-            if floConnected {
-                log("📡 FLO connection lost")
-            }
-            floConnected = false
-            floStatus = "Not connected"
-            truckName = nil
+        let wasConnected = floConnected
+        floConnected = FLOService.shared.isConnected
+        truckName = FLOService.shared.truckName.isEmpty ? nil : FLOService.shared.truckName
+        floStatus = floConnected ? "Connected" : "Not connected"
+        
+        if floConnected && !wasConnected {
+            log("📡 Connected to FLO: \(FLOService.shared.truckName)")
+        } else if !floConnected && wasConnected {
+            log("📡 FLO disconnected")
         }
         
         updateSyncStatus()
     }
     
     // MARK: - Main Sync (Download from FLO)
+    //
+    // All FLO HTTP calls now go through FLOService, which uses a WiFi-pinned
+    // URLSession (allowsCellularAccess = false). This guarantees requests always
+    // reach 192.168.4.1 over WiFi even when iOS has enabled LTE in the background.
     func sync() async {
         guard floConnected else {
             log("❌ Not connected to FLO")
             return
         }
         
-        guard TruckService.shared.hasTruckSelected else {
-            log("❌ No truck selected — pick a truck in Settings first")
+        guard EquipmentService.shared.hasEquipmentSelected else {
+            log("❌ No equipment selected — pick equipment in Settings first")
             return
         }
         
@@ -186,56 +167,66 @@ class SyncManager: ObservableObject {
         syncComplete = false
         log("⬇️ Downloading from FLO...")
         
-        do {
-            // Get file list from FLO
-            let files = try await getFileList()
+        // Step 1: Get file list via FLOService (WiFi-pinned)
+        let files = await FLOService.shared.fetchDaylogList()
 
-            if files.isEmpty {
-                log("✓ No files on FLO")
-                isSyncing = false
-                updateSyncStatus()
-                return
-            }
+        if files.isEmpty {
+            log("✓ No files on FLO")
+            isSyncing = false
+            updateSyncStatus()
+            return
+        }
 
-            log("Found \(files.count) file(s)")
+        log("Found \(files.count) file(s)")
 
-            // Download ALL files - Supabase dedupes via upsert
-            for file in files {
-                log("  📄 \(file.name)")
-                
-                let csvContent = try await downloadFile(name: file.name)
-                let rows = parseCSV(csvContent)
-                
-                if rows.isEmpty {
-                    continue
-                }
-                
-                log("    └ \(rows.count) rows")
-                
-                // Determine table based on filename
-                let tableName = file.name.contains(".manual") ? "viewer_logs" : "source_logs"
-                
-                // Store locally
-                let pending = PendingSync(
-                    truckId: TruckService.shared.selectedTruckId!,
-                    fileName: file.name,
-                    tableName: tableName,
-                    rows: rows,
-                    downloadedAt: Date()
-                )
-                pendingData.append(pending)
+        // Step 2: Download each file via FLOService (WiFi-pinned)
+        var downloadedCount = 0
+        for file in files {
+            log("  📄 \(file.name)")
+            
+            guard let csvContent = await FLOService.shared.downloadDaylog(name: file.name) else {
+                log("  ⚠️ \(file.name) — download returned nil, skipping")
+                continue
             }
             
-            // Save to disk
-            savePendingToDisk()
+            let rows = parseCSV(csvContent)
             
-            // Clear downloaded files from FLO
-            try await clearDownloaded()
+            if rows.isEmpty {
+                log("  ⚠️ \(file.name) — no parseable rows, skipping")
+                continue
+            }
             
-            log("✅ Downloaded \(files.count) file(s)")
+            log("    └ \(rows.count) rows")
             
-        } catch {
-            log("❌ Download failed: \(error.localizedDescription)")
+            // Determine table based on filename
+            let tableName = file.name.contains(".manual") ? "viewer_logs" : "source_logs"
+            
+            // Store locally for upload — stamp with compound identifier
+            let pending = PendingSync(
+                truckId: EquipmentService.shared.operatorIdentifier ?? EquipmentService.shared.selectedEquipmentCode!,
+                fileName: file.name,
+                tableName: tableName,
+                rows: rows,
+                downloadedAt: Date()
+            )
+            pendingData.append(pending)
+            downloadedCount += 1
+        }
+        
+        // Step 3: Save to disk before clearing FLO
+        // IMPORTANT: Save happens before clear. If clear fails, we still have the data
+        // locally and won't re-download on next sync (Supabase upsert dedupes anyway).
+        savePendingToDisk()
+        
+        // Step 4: Clear downloaded files from FLO via FLOService (WiFi-pinned)
+        if downloadedCount > 0 {
+            let cleared = await FLOService.shared.clearDownloadedFiles()
+            if cleared {
+                log("✅ Downloaded \(downloadedCount) file(s)")
+            } else {
+                // Non-fatal — files will be re-downloaded next sync but Supabase dedupes
+                log("✅ Downloaded \(downloadedCount) file(s) — ⚠️ clear failed (will re-download next sync, deduped)")
+            }
         }
         
         isSyncing = false
@@ -308,59 +299,6 @@ class SyncManager: ObservableObject {
         updateSyncStatus()
     }
     
-    
-    
-    // MARK: - FLO API Calls
-    private func getFileList() async throws -> [FLOFile] {
-        guard let url = URL(string: "\(floBaseURL)/daylog/list") else {
-            throw SyncError.invalidURL
-        }
-        
-        let (data, _) = try await URLSession.shared.data(from: url)
-        
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let filesArray = json["files"] as? [[String: Any]] else {
-            throw SyncError.parseError
-        }
-        
-        return filesArray.compactMap { dict -> FLOFile? in
-            guard let name = dict["name"] as? String else { return nil }
-            let downloaded = dict["downloaded"] as? Bool ?? false
-            let size = dict["size"] as? Int ?? 0
-            return FLOFile(name: name, downloaded: downloaded, size: size)
-        }
-    }
-    
-    private func downloadFile(name: String) async throws -> String {
-        guard let url = URL(string: "\(floBaseURL)/daylog/download?name=\(name)") else {
-            throw SyncError.invalidURL
-        }
-        
-        let (data, _) = try await URLSession.shared.data(from: url)
-        
-        guard let content = String(data: data, encoding: .utf8) else {
-            throw SyncError.parseError
-        }
-        
-        return content
-    }
-    
-    private func clearDownloaded() async throws {
-        guard let url = URL(string: "\(floBaseURL)/api/clear-downloaded") else {
-            throw SyncError.invalidURL
-        }
-        
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        
-        let (_, response) = try await URLSession.shared.data(for: request)
-        
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw SyncError.clearFailed
-        }
-    }
-    
     // MARK: - CSV Parsing
     private func parseCSV(_ content: String) -> [[String: Any]] {
         let lines = content.components(separatedBy: .newlines)
@@ -377,16 +315,16 @@ class SyncManager: ObservableObject {
             
             let row: [String: Any] = [
                 "timestamp_iso": parts[0],
-                "header": parts[1],
-                "subheader": parts[2],
-                "action": parts[3],
-                "gallons": Double(parts[4]) ?? 0,
-                "ounces": Double(parts[5]) ?? 0,
-                "psi": Double(parts[6]) ?? 0,
-                "mix": parts[7],
-                "relays": parts[8],
-                "lat": Double(parts[9]) ?? 0,
-                "lon": Double(parts[10]) ?? 0
+                "header":        parts[1],
+                "subheader":     parts[2],
+                "action":        parts[3],
+                "gallons":       Double(parts[4]) ?? 0,
+                "ounces":        Double(parts[5]) ?? 0,
+                "psi":           Double(parts[6]) ?? 0,
+                "mix":           parts[7],
+                "relays":        parts[8],
+                "lat":           Double(parts[9]) ?? 0,
+                "lon":           Double(parts[10]) ?? 0
             ]
             
             rows.append(row)
@@ -503,7 +441,6 @@ class SyncManager: ObservableObject {
         }
     }
     
-    
     private func log(_ message: String) {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mm:ss a"
@@ -514,11 +451,9 @@ class SyncManager: ObservableObject {
 }
 
 // MARK: - Supporting Types
-struct FLOFile {
-    let name: String
-    let downloaded: Bool
-    let size: Int
-}
+
+// NOTE: FLOFile struct removed. FLOService.DaylogFile is now used directly.
+// If any other file referenced FLOFile, update those references to FLOService.DaylogFile.
 
 struct PendingSync: Codable {
     let truckId: String

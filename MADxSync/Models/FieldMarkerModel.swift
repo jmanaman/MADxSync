@@ -674,7 +674,7 @@ class MarkerStore: ObservableObject {
             throw MarkerSyncError.invalidURL
         }
         
-        let payload = marker.toSupabasePayload(deviceId: deviceId, truckId: TruckService.shared.selectedTruckId)
+        let payload = marker.toSupabasePayload(deviceId: deviceId, truckId: EquipmentService.shared.operatorIdentifier)
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -707,7 +707,7 @@ class MarkerStore: ObservableObject {
             throw MarkerSyncError.invalidURL
         }
         
-        let payload = marker.toSourceNotePayload(truckId: TruckService.shared.selectedTruckId)
+        let payload = marker.toSourceNotePayload(truckId: EquipmentService.shared.operatorIdentifier)
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -802,7 +802,7 @@ class MarkerStore: ObservableObject {
             
             var undoPayload = lastMarker.toSupabasePayload(
                 deviceId: deviceId,
-                truckId: TruckService.shared.selectedTruckId
+                truckId: EquipmentService.shared.operatorIdentifier
             )
             undoPayload["marker_type"] = "UNDO"
             undoPayload["undo_target_lat"] = lastMarker.lat

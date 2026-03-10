@@ -39,7 +39,10 @@ struct SettingsView: View {
     @EnvironmentObject var authService: AuthService
     @ObservedObject private var floService = FLOService.shared
     @ObservedObject private var truckService = TruckService.shared
-    @State private var showTruckPicker = false
+    @ObservedObject private var equipmentService = EquipmentService.shared
+    @ObservedObject private var positionService = PositionService.shared
+    @State private var showEquipmentPicker = false
+    @State private var showPositionPicker = false
     @State private var isDownloadingMaps = false
     @State private var downloadProgress: Double = 0
     @State private var downloadError: String?
@@ -86,24 +89,58 @@ struct SettingsView: View {
                     }
                 }
                 
-                // Truck Identity
-                Section(header: Text("Truck")) {
+                // Equipment Identity
+                Section(header: Text("Equipment")) {
                     HStack {
-                        Image(systemName: "truck.box.fill")
+                        Image(systemName: EquipmentService.iconName(for: equipmentService.selectedEquipmentType ?? "other"))
                             .foregroundColor(.blue)
-                        Text(truckService.selectedTruckName ?? "Not Selected")
+                        Text(equipmentService.selectedEquipmentName ?? "Not Selected")
                             .fontWeight(.medium)
                         Spacer()
-                        if let num = truckService.selectedTruckNumber {
-                            Text("#\(num)")
+                        if let code = equipmentService.selectedEquipmentCode {
+                            Text(code)
+                                .font(.caption.monospaced())
                                 .foregroundColor(.secondary)
                         }
                     }
                     
-                    Button(action: { showTruckPicker = true }) {
+                    Button(action: { showEquipmentPicker = true }) {
                         HStack {
                             Image(systemName: "arrow.triangle.2.circlepath")
-                            Text("Switch Truck")
+                            Text("Switch Equipment")
+                        }
+                    }
+                }
+                
+                // Operator Position
+                Section(header: Text("Operator")) {
+                    HStack {
+                        Image(systemName: "person.fill")
+                            .foregroundColor(.orange)
+                        Text(positionService.selectedPositionLabel ?? "Not Selected")
+                            .fontWeight(.medium)
+                        Spacer()
+                        if let code = positionService.selectedPositionCode {
+                            Text(code)
+                                .font(.caption.monospaced())
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    
+                    Button(action: { showPositionPicker = true }) {
+                        HStack {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                            Text("Switch Position")
+                        }
+                    }
+                    
+                    if let identifier = equipmentService.operatorIdentifier {
+                        HStack {
+                            Image(systemName: "tag.fill")
+                                .foregroundColor(.green)
+                            Text("Log ID: \(identifier)")
+                                .font(.subheadline.monospaced())
+                                .foregroundColor(.secondary)
                         }
                     }
                 }
@@ -304,8 +341,11 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Settings")
-            .sheet(isPresented: $showTruckPicker) {
-                TruckPickerView(isSheet: true)
+            .sheet(isPresented: $showEquipmentPicker) {
+                EquipmentPickerView(isSheet: true)
+            }
+            .sheet(isPresented: $showPositionPicker) {
+                PositionPickerView(isSheet: true)
             }
             .alert("Sign Out?", isPresented: $showSignOutConfirm) {
                 Button("Sign Out", role: .destructive) {

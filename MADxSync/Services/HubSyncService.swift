@@ -103,6 +103,8 @@ final class HubSyncService: ObservableObject {
         Task { await pullServiceRequests() }
         Task { await pullWorkingNotes() }
         Task { await pullSourceNotes() }
+        Task { await pullEquipmentList() }
+        Task { await pullPositionList() }
     }
     
     // MARK: - Channel: Spatial Layers (Hourly + Promotion Triggered)
@@ -342,6 +344,30 @@ final class HubSyncService: ObservableObject {
         defer { setBusy(channel, false) }
         
         await SourceNotesService.shared.pullFromHub()
+        recordSuccess(channel)
+    }
+    
+    // MARK: - Channel: Equipment List
+    
+    private func pullEquipmentList() async {
+        let channel = "equipmentList"
+        guard !isBusy(channel) else { return }
+        setBusy(channel, true)
+        defer { setBusy(channel, false) }
+        
+        await EquipmentService.shared.fetchEquipment()
+        recordSuccess(channel)
+    }
+    
+    // MARK: - Channel: Position List
+    
+    private func pullPositionList() async {
+        let channel = "positionList"
+        guard !isBusy(channel) else { return }
+        setBusy(channel, true)
+        defer { setBusy(channel, false) }
+        
+        await PositionService.shared.fetchPositions()
         recordSuccess(channel)
     }
     

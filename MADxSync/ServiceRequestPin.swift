@@ -24,6 +24,11 @@ struct ServiceRequestPin: Codable, Identifiable, Equatable {
     var latitude: Double
     var longitude: Double
     
+    // Intake tracking
+    var requestNumber: Int?
+    var intakeMethod: String?
+    var takenBy: String?
+    
     // Caller info (SR-specific)
     var callerName: String?
     var callerPhone: String?
@@ -59,6 +64,9 @@ struct ServiceRequestPin: Codable, Identifiable, Equatable {
         case id
         case districtId = "district_id"
         case latitude, longitude
+        case requestNumber = "request_number"
+        case intakeMethod = "intake_method"
+        case takenBy = "taken_by"
         case callerName = "caller_name"
         case callerPhone = "caller_phone"
         case address, city, state, zip
@@ -110,13 +118,14 @@ struct ServiceRequestPin: Codable, Identifiable, Equatable {
     }
     
     var displayTitle: String {
+        let srPrefix = requestNumber != nil ? "SR-\(String(format: "%03d", requestNumber!)) — " : ""
         if let full = fullAddress {
-            return full
+            return srPrefix + full
         }
         if let addr = address, !addr.isEmpty {
-            return addr
+            return srPrefix + addr
         }
-        return "\(sourceTypeLabel) — \(String(format: "%.4f, %.4f", latitude, longitude))"
+        return "\(srPrefix)\(sourceTypeLabel) — \(String(format: "%.4f, %.4f", latitude, longitude))"
     }
     
     /// Caller display string for banner and detail views
@@ -151,6 +160,9 @@ extension ServiceRequestPin {
             districtId: districtId,
             latitude: latitude,
             longitude: longitude,
+            requestNumber: row["request_number"] as? Int,
+            intakeMethod: row["intake_method"] as? String,
+            takenBy: row["taken_by"] as? String,
             callerName: row["caller_name"] as? String,
             callerPhone: row["caller_phone"] as? String,
             address: row["address"] as? String,

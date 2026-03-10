@@ -172,6 +172,15 @@ struct FieldMapView: View {
                 }
                 
                 Spacer()
+                
+                // Operator badge — always visible, bottom-left above toolbar
+                HStack {
+                    OperatorBadgeView()
+                        .padding(.leading, 12)
+                        .padding(.bottom, 4)
+                    Spacer()
+                }
+                
                 bottomBar
             }
             
@@ -2022,12 +2031,14 @@ struct FeatureInfoView: View {
                 }
             }
             .alert("Change Cycle?", isPresented: $showCycleConfirm) {
-                Button("Set to \(pendingCycleDays) days", role: .none) {
+                Button(pendingCycleDays >= 9999 ? "Push Off Indefinitely" : "Set to \(pendingCycleDays) days", role: .none) {
                     applyCycleChange(pendingCycleDays)
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This source will rotate green → yellow → orange → red over \(pendingCycleDays) days instead of \(treatmentStatusService.statusForFeature(featureId).cycleDays) days.")
+                Text(pendingCycleDays >= 9999
+                     ? "This source will turn grey and be excluded from treatment rotation until unfrozen."
+                     : "This source will rotate green → yellow → orange → red over \(pendingCycleDays) days instead of \(treatmentStatusService.statusForFeature(featureId).cycleDays) days.")
             }
         }
     }
@@ -2380,7 +2391,7 @@ struct CycleDayChipRow: View {
     let onSelect: (Int) -> Void
     
     // Preset values — covers all practical scenarios
-    private let presets = [7, 14, 21, 30, 60, 90, 120, 180, 360]
+    private let presets = [7, 14, 21, 30, 60, 90, 120, 180, 360, 9999]
     
     var body: some View {
         // Two rows of chips for easy tapping with gloves
@@ -2433,14 +2444,15 @@ struct CycleDayChip: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 8)
                 .frame(minWidth: 44, minHeight: 36)  // Minimum tap target for gloves
-                .background(isSelected ? Color.blue : Color(.tertiarySystemBackground))
-                .foregroundColor(isSelected ? .white : .primary)
+                .background(isSelected ? (days >= 9999 ? Color.gray : Color.blue) : Color(.tertiarySystemBackground))
+                .foregroundColor(isSelected ? .white : (days >= 9999 ? .gray : .primary))
                 .cornerRadius(8)
         }
         .buttonStyle(.plain)
     }
     
     private var chipLabel: String {
+        if days >= 9999 { return "∞" }
         if days < 30 { return "\(days)d" }
         if days == 30 { return "30d" }
         if days == 60 { return "60d" }
