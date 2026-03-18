@@ -52,6 +52,7 @@ struct FieldMapView: View {
     @State private var activeTool: ActiveTool = .none
     @State private var treatmentFamily: TreatmentFamily = .field
     @State private var treatmentStatus: TreatmentStatus = .treated
+    @State private var applicationMethod: ApplicationMethod = .truck
     @State private var selectedChemical: String = "BTI Sand"
     @State private var doseValue: Double = 4.0
     @State private var doseUnit: DoseUnit = .oz
@@ -531,8 +532,9 @@ struct FieldMapView: View {
                 chemical: selectedChemical,
                 doseValue: doseValue,
                 doseUnit: doseUnit.rawValue,
-                featureId: featureId,       // NEW — stored for HUB matching
-                featureType: featureType    // NEW — stored for HUB matching
+                featureId: featureId,
+                featureType: featureType,
+                applicationMethod: treatmentStatus == .treated ? applicationMethod.rawValue : nil
             )
             
             markerStore.addMarker(marker)
@@ -663,6 +665,14 @@ struct FieldMapView: View {
                         .foregroundColor(.white)
                         .cornerRadius(8)
                 }
+            }
+            if treatmentStatus == .treated {
+                Picker("", selection: $applicationMethod) {
+                    ForEach(ApplicationMethod.allCases) { m in
+                        Text(m.displayName).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
             }
             HStack(spacing: 10) {
                 Menu {

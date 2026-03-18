@@ -152,6 +152,30 @@ enum LarvaeLevel: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - Application Method
+/// How the treatment was applied — modifier on the treatment record, not equipment.
+/// A tech with a backpack is still operating out of T14. This answers
+/// "what did POS01 apply on foot vs from the truck."
+enum ApplicationMethod: String, CaseIterable, Identifiable {
+    case truck = "truck"
+    case backpack = "backpack"
+    case handCan = "hand_can"
+    case granuleSpreader = "granule_spreader"
+    case other = "other"
+    
+    var id: String { rawValue }
+    
+    var displayName: String {
+        switch self {
+        case .truck: return "Truck"
+        case .backpack: return "Backpack"
+        case .handCan: return "Hand-can"
+        case .granuleSpreader: return "Spreader"
+        case .other: return "Other"
+        }
+    }
+}
+
 // MARK: - Field Marker
 /// A marker placed on the map representing a treatment, inspection, observation, or note
 ///
@@ -187,6 +211,9 @@ struct FieldMarker: Identifiable, Codable {
     var featureId: String?       // ID of the spatial feature this marker was matched to
     var featureType: String?     // "field", "polyline", "pointsite", "stormdrain"
     
+    // Application method — how treatment was applied (truck, backpack, hand_can, etc.)
+    var applicationMethod: String?
+    
     // Sync tracking
     var syncedToFLO: Bool
     var syncedToSupabase: Bool
@@ -205,7 +232,8 @@ struct FieldMarker: Identifiable, Codable {
         notes: String? = nil,
         noteText: String? = nil,
         featureId: String? = nil,
-        featureType: String? = nil
+        featureType: String? = nil,
+        applicationMethod: String? = nil
     ) {
         self.id = UUID()
         self.timestamp = Date()
@@ -223,6 +251,7 @@ struct FieldMarker: Identifiable, Codable {
         self.noteText = noteText
         self.featureId = featureId
         self.featureType = featureType
+        self.applicationMethod = applicationMethod
         self.syncedToFLO = false
         self.syncedToSupabase = false
     }
@@ -338,6 +367,9 @@ struct FieldMarker: Identifiable, Codable {
         // Feature matching — allows HUB to match by ID instead of proximity
         if let featureId = featureId { payload["feature_id"] = featureId }
         if let featureType = featureType { payload["feature_type"] = featureType }
+        
+        // Application method — how treatment was applied
+        if let applicationMethod = applicationMethod { payload["application_method"] = applicationMethod }
         
         return payload
     }
@@ -674,7 +706,8 @@ class MarkerStore: ObservableObject {
             throw MarkerSyncError.invalidURL
         }
         
-        let payload = marker.toSupabasePayload(deviceId: deviceId, truckId: EquipmentService.shared.operatorIdentifier)
+        let truckIdValue = EquipmentService.shared.operatorIdentifier ?? TruckService.shared.selectedTruckId
+        let payload = marker.toSupabasePayload(deviceId: deviceId, truckId: truckIdValue)
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -707,7 +740,8 @@ class MarkerStore: ObservableObject {
             throw MarkerSyncError.invalidURL
         }
         
-        let payload = marker.toSourceNotePayload(truckId: EquipmentService.shared.operatorIdentifier)
+        let noteIdValue = EquipmentService.shared.operatorIdentifier ?? TruckService.shared.selectedTruckId
+        let payload = marker.toSourceNotePayload(truckId: noteIdValue)
         
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -802,7 +836,7 @@ class MarkerStore: ObservableObject {
             
             var undoPayload = lastMarker.toSupabasePayload(
                 deviceId: deviceId,
-                truckId: EquipmentService.shared.operatorIdentifier
+                truckId: EquipmentService.shared.operatorIdentifier ?? TruckService.shared.selectedTruckId
             )
             undoPayload["marker_type"] = "UNDO"
             undoPayload["undo_target_lat"] = lastMarker.lat
