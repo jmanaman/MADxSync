@@ -2,17 +2,25 @@
 //  HubSyncService.swift
 //  MADxSync
 //
-//  Silent 60-second polling service that pulls fresh data from Supabase.
+//  Silent polling service that pulls fresh data from Supabase.
 //  Each channel (pending sources, treatment status, spatial layers, etc.)
 //  is independent. If a pull succeeds, data swaps in atomically.
 //  If it fails, nothing changes. The tech never knows.
+//
+//  EGRESS OPTIMIZATION (2026-03-17):
+//  - Channels are split into FAST (60s) and SLOW (300s) tiers
+//  - treatment_status uses conditional fetching (updated_at > lastSync)
+//  - equipment + positions load ONCE on start, never poll
+//  - Source notes + working notes on slow (5 min) cycle
+//  - Activity-aware: goes DARK after 5 min of no interaction (foreground idle)
+//  - Full catch-up fetch on wake from dark/background
 //
 //  RULES:
 //  - Foreground only. Timer stops in background, restarts in foreground.
 //  - No network checking. Just try and fail gracefully.
 //  - No auth management. If token expired, 401 fails silently, auth refreshes on its own cycle.
 //  - No user-facing errors. Console logging only.
-//  - No retry logic. Constant 60-second interval, always.
+//  - No retry logic. Constant interval, always.
 //  - Each channel is atomic. Full response or no update.
 //  - Non-blocking. Never touches FLO, GPS, map rendering, or treatment tools.
 //  - Multi-tenant safe. All queries filter by AuthService.shared.districtId at runtime.
@@ -27,11 +35,17 @@ final class HubSyncService: ObservableObject {
     
     // MARK: - Configuration
     
-    /// Poll interval in seconds. 60s = gentle on Supabase, fresh enough for field ops.
-    private let pollInterval: TimeInterval = 60.0
+    /// Fast poll interval: operationally time-sensitive channels
+    private let fastInterval: TimeInterval = 60.0
+    
+    /// Slow poll interval: channels that change infrequently
+    private let slowInterval: TimeInterval = 300.0
     
     /// Spatial refresh interval. 3600s = once per hour. Heavy pull, rarely changes.
     private let spatialRefreshInterval: TimeInterval = 3600.0
+    
+    /// Idle timeout: if no user interaction for this long, stop polling
+    private let idleTimeout: TimeInterval = 300.0  // 5 minutes
     
     /// Last spatial refresh time
     private var lastSpatialRefresh: Date?
@@ -48,8 +62,13 @@ final class HubSyncService: ObservableObject {
     
     // MARK: - State
     
-    private var timer: Timer?
+    private var fastTimer: Timer?
+    private var slowTimer: Timer?
     private var isActive = false
+    
+    /// Activity tracking — last user interaction time
+    private var lastUserActivity: Date = Date()
+    private var isDark = false
     
     /// Per-channel lock to prevent overlapping pulls
     private var channelBusy: [String: Bool] = [:]
@@ -60,6 +79,12 @@ final class HubSyncService: ObservableObject {
     /// Consecutive failure count per channel (for logging throttle only, not backoff)
     private var failureCount: [String: Int] = [:]
     
+    /// Last treatment_status sync timestamp — for conditional fetching
+    private var lastTreatmentStatusSync: String?
+    
+    /// Whether the one-time loads (equipment, positions) have completed
+    private var oneTimeLoadsComplete = false
+    
     private init() {}
     
     // MARK: - Lifecycle (called from MADxSyncApp)
@@ -68,14 +93,33 @@ final class HubSyncService: ObservableObject {
     func start() {
         guard !isActive else { return }
         isActive = true
+        isDark = false
+        lastUserActivity = Date()
         
-        print("[HubSync] Started — polling every \(Int(pollInterval))s")
+        print("[HubSync] Started — fast=\(Int(fastInterval))s, slow=\(Int(slowInterval))s")
         
-        // Fire immediately on start, then every 60 seconds
-        pollNow()
+        // One-time loads on first start
+        if !oneTimeLoadsComplete {
+            Task {
+                await pullEquipmentList()
+                await pullPositionList()
+                oneTimeLoadsComplete = true
+                print("[HubSync] One-time loads complete (equipment + positions)")
+            }
+        }
         
-        timer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            self?.pollNow()
+        // Full catch-up fetch on start (coming from background or first launch)
+        lastTreatmentStatusSync = nil  // Force full treatment_status pull on wake
+        pollFastChannels()
+        pollSlowChannels()
+        
+        // Start timers
+        fastTimer = Timer.scheduledTimer(withTimeInterval: fastInterval, repeats: true) { [weak self] _ in
+            self?.fastTick()
+        }
+        
+        slowTimer = Timer.scheduledTimer(withTimeInterval: slowInterval, repeats: true) { [weak self] _ in
+            self?.slowTick()
         }
     }
     
@@ -83,16 +127,54 @@ final class HubSyncService: ObservableObject {
     func stop() {
         guard isActive else { return }
         isActive = false
-        timer?.invalidate()
-        timer = nil
+        fastTimer?.invalidate()
+        fastTimer = nil
+        slowTimer?.invalidate()
+        slowTimer = nil
         print("[HubSync] Stopped")
     }
     
-    // MARK: - Poll Cycle
+    /// Call this from UI interaction handlers to signal user activity.
+    /// Prevents idle-dark mode while tech is actively using the app.
+    func reportUserActivity() {
+        lastUserActivity = Date()
+        
+        // Wake from dark mode — immediate catch-up
+        if isDark {
+            isDark = false
+            lastTreatmentStatusSync = nil  // Force full pull on wake
+            print("[HubSync] Waking from idle-dark — catch-up fetch")
+            pollFastChannels()
+            pollSlowChannels()
+        }
+    }
     
-    /// Kick off all channel pulls. Each is independent and non-blocking.
-    private func pollNow() {
-        // Gate on auth — if not authenticated, skip silently
+    // MARK: - Timer Ticks
+    
+    private func fastTick() {
+        // Check for idle timeout
+        let idleTime = Date().timeIntervalSince(lastUserActivity)
+        if idleTime >= idleTimeout {
+            if !isDark {
+                isDark = true
+                print("[HubSync] No interaction for \(Int(idleTime))s — going dark (zero polling)")
+            }
+            return  // Skip this tick entirely
+        }
+        
+        isDark = false
+        pollFastChannels()
+    }
+    
+    private func slowTick() {
+        if isDark { return }  // Skip when dark
+        pollSlowChannels()
+    }
+    
+    // MARK: - Poll Cycles
+    
+    /// Fast channels: operationally time-sensitive (60s)
+    private func pollFastChannels() {
         guard AuthService.shared.isAuthenticated else { return }
         guard AuthService.shared.districtId != nil else { return }
         
@@ -101,10 +183,15 @@ final class HubSyncService: ObservableObject {
         Task { await refreshSpatialIfDue() }
         Task { await pullSourceFinderPins() }
         Task { await pullServiceRequests() }
+    }
+    
+    /// Slow channels: change infrequently (300s)
+    private func pollSlowChannels() {
+        guard AuthService.shared.isAuthenticated else { return }
+        guard AuthService.shared.districtId != nil else { return }
+        
         Task { await pullWorkingNotes() }
         Task { await pullSourceNotes() }
-        Task { await pullEquipmentList() }
-        Task { await pullPositionList() }
     }
     
     // MARK: - Channel: Spatial Layers (Hourly + Promotion Triggered)
@@ -287,17 +374,26 @@ final class HubSyncService: ObservableObject {
         return sources
     }
     
-    // MARK: - Channel: Treatment Status
+    // MARK: - Channel: Treatment Status (CONDITIONAL FETCH)
     
     private func pullTreatmentStatus() async {
-            let channel = "treatmentStatus"
-            guard !isBusy(channel) else { return }
-            setBusy(channel, true)
-            defer { setBusy(channel, false) }
-            
-            await TreatmentStatusService.shared.syncFromHub()
-            recordSuccess(channel)
+        let channel = "treatmentStatus"
+        guard !isBusy(channel) else { return }
+        setBusy(channel, true)
+        defer { setBusy(channel, false) }
+        
+        // If we have a last sync time, do conditional fetch (delta only)
+        // Otherwise do a full pull (first load or wake from dark)
+        if let lastSync = lastTreatmentStatusSync {
+            await TreatmentStatusService.shared.syncFromHub(since: lastSync)
+        } else {
+            await TreatmentStatusService.shared.syncFromHub(since: nil)
         }
+        
+        // Update the sync timestamp for next conditional fetch
+        lastTreatmentStatusSync = ISO8601DateFormatter().string(from: Date())
+        recordSuccess(channel)
+    }
     
     // MARK: - Channel: Source Finder Pins
     
@@ -323,7 +419,7 @@ final class HubSyncService: ObservableObject {
         recordSuccess(channel)
     }
     
-    // MARK: - Channel: Working Notes (Field Discussion Tool)
+    // MARK: - Channel: Working Notes (SLOW — 5 min cycle)
     
     private func pullWorkingNotes() async {
         let channel = "workingNotes"
@@ -335,7 +431,7 @@ final class HubSyncService: ObservableObject {
         recordSuccess(channel)
     }
     
-    // MARK: - Channel: Source Notes (Permanent Notes)
+    // MARK: - Channel: Source Notes (SLOW — 5 min cycle)
     
     private func pullSourceNotes() async {
         let channel = "sourceNotes"
@@ -347,7 +443,9 @@ final class HubSyncService: ObservableObject {
         recordSuccess(channel)
     }
     
-    // MARK: - Channel: Equipment List
+    // MARK: - One-Time Loads: Equipment + Positions
+    // These change ~monthly. Load once on app start, never poll.
+    // User can force-refresh by restarting app.
     
     private func pullEquipmentList() async {
         let channel = "equipmentList"
@@ -358,8 +456,6 @@ final class HubSyncService: ObservableObject {
         await EquipmentService.shared.fetchEquipment()
         recordSuccess(channel)
     }
-    
-    // MARK: - Channel: Position List
     
     private func pullPositionList() async {
         let channel = "positionList"

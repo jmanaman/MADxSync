@@ -71,6 +71,7 @@ struct FieldMapView: View {
     @State private var snapSourceName: String = ""
     @State private var mapRefreshTrigger: Int = 0
     @State private var showRoutePolyline: Bool = false
+    @FocusState private var doseFieldFocused: Bool
     
     var body: some View {
         ZStack {
@@ -327,6 +328,12 @@ struct FieldMapView: View {
     
     // MARK: - Handle Map Tap
     private func handleMapTap(_ coordinate: CLLocationCoordinate2D, screenPoint: CGPoint) {
+        // If the dose keyboard is up, dismiss it instead of dropping a marker
+        if doseFieldFocused {
+            doseFieldFocused = false
+            return
+        }
+        
         let snapResult = SnapService.checkSnap(
             coordinate: coordinate,
             pointSites: layerVisibility.showPointSites ? spatialService.pointSites : [],
@@ -643,6 +650,9 @@ struct FieldMapView: View {
     }
     
     // MARK: - Treatment Context Strip
+    @State private var showChemicalSheet = false
+    @State private var showUnitSheet = false
+    
     private var treatmentContextStrip: some View {
         VStack(spacing: 10) {
             HStack {
@@ -675,18 +685,8 @@ struct FieldMapView: View {
                 .pickerStyle(.segmented)
             }
             HStack(spacing: 10) {
-                Menu {
-                    ForEach(ChemicalData.byCategory, id: \.category) { group in
-                        Section(group.category.rawValue) {
-                            ForEach(group.chemicals) { chem in
-                                Button(chem.name) {
-                                    selectedChemical = chem.name
-                                    updateUnitForChemical(chem.name)
-                                }
-                            }
-                        }
-                    }
-                } label: {
+                // Chemical picker — opens as sheet to avoid scroll-rewind from parent re-renders
+                Button(action: { showChemicalSheet = true }) {
                     HStack(spacing: 4) {
                         Text(selectedChemical).font(.subheadline).lineLimit(1).frame(maxWidth: 140, alignment: .leading)
                         Image(systemName: "chevron.down").font(.caption2)
@@ -694,21 +694,28 @@ struct FieldMapView: View {
                     .padding(.horizontal, 10).padding(.vertical, 8)
                     .background(Color(.secondarySystemBackground)).cornerRadius(8)
                 }
-                Spacer()
+                .foregroundColor(.primary)
                 TextField("0", value: $doseValue, format: .number)
                     .keyboardType(.decimalPad)
+                    .focused($doseFieldFocused)
                     .font(.system(.body, design: .monospaced))
                     .frame(width: 60).multilineTextAlignment(.center)
                     .padding(.vertical, 6).background(Color(.secondarySystemBackground)).cornerRadius(6)
-                Menu {
-                    ForEach(DoseUnit.allCases) { unit in
-                        Button(unit.rawValue) { doseUnit = unit }
+                    .toolbar {
+                        ToolbarItemGroup(placement: .keyboard) {
+                            Spacer()
+                            Button("Done") { doseFieldFocused = false }
+                                .fontWeight(.semibold)
+                        }
                     }
-                } label: {
+                // Unit picker — sheet to avoid FAB overlap on phones
+                Button(action: { showUnitSheet = true }) {
                     Text(doseUnit.rawValue).font(.subheadline)
                         .padding(.horizontal, 10).padding(.vertical, 8)
                         .background(Color(.secondarySystemBackground)).cornerRadius(6)
                 }
+                .foregroundColor(.primary)
+                Spacer() // Absorbs right side — keeps controls clear of FAB column
             }
             HStack(spacing: 6) {
                 ForEach(dosePresetsForUnit, id: \.self) { preset in
@@ -727,6 +734,18 @@ struct FieldMapView: View {
         }
         .padding(12)
         .background(.ultraThinMaterial)
+        .sheet(isPresented: $showChemicalSheet) {
+            TreatmentChemicalPicker(selectedChemical: $selectedChemical) { chemName in
+                updateUnitForChemical(chemName)
+            }
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+        }
+        .sheet(isPresented: $showUnitSheet) {
+            TreatmentUnitPicker(selectedUnit: $doseUnit)
+                .presentationDetents([.medium])
+                .presentationDragIndicator(.visible)
+        }
     }
     
     private func formatPreset(_ value: Double) -> String {
@@ -1167,6 +1186,22 @@ struct SpatialMapView: UIViewRepresentable {
         /// GPU-composited heading arrow (replaces HeadingArrowOverlay)
         var headingArrowView: HeadingArrowView?
         
+        /// Check if any text field/view is currently first responder (keyboard is up)
+        static func isKeyboardVisible(in window: UIWindow?) -> Bool {
+            guard let window = window else { return false }
+            // Walk the view hierarchy looking for a focused UITextField or UITextView
+            func findFirstResponder(in view: UIView) -> Bool {
+                if (view is UITextField || view is UITextView) && view.isFirstResponder {
+                    return true
+                }
+                for subview in view.subviews {
+                    if findFirstResponder(in: subview) { return true }
+                }
+                return false
+            }
+            return findFirstResponder(in: window)
+        }
+        
         // Spatial layer tracking
         private var currentBoundaryIds: Set<String> = []
         private var hasFieldOverlay = false
@@ -1325,6 +1360,17 @@ struct SpatialMapView: UIViewRepresentable {
         // MARK: - Tap Handling
         
         @objc func handleTap(_ gesture: UITapGestureRecognizer) {
+            HubSyncService.shared.reportUserActivity()
+            
+            // If the decimal pad keyboard is showing (from the dose TextField),
+            // dismiss it and swallow the tap — don't drop a marker.
+            // We detect the keyboard by checking for any UITextField that is first responder.
+            if let mapView = gesture.view as? MKMapView,
+               Self.isKeyboardVisible(in: mapView.window) {
+                mapView.window?.endEditing(true)
+                return
+            }
+            
             guard let mapView = gesture.view as? MKMapView else { return }
             let point = gesture.location(in: mapView)
             let coordinate = mapView.convert(point, toCoordinateFrom: mapView)
@@ -1447,6 +1493,7 @@ struct SpatialMapView: UIViewRepresentable {
         
         // Reposition arrow AFTER pan/zoom completes (final snap to correct position)
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
+            HubSyncService.shared.reportUserActivity()
             headingArrowView?.repositionOnMap()
         }
         
@@ -2473,4 +2520,87 @@ struct CycleDayChip: View {
         return "\(days)d"
     }
 }
+// MARK: - Treatment Chemical Picker (Sheet)
+/// Dedicated sheet for chemical selection — isolated from parent re-renders
+/// so scroll position is preserved while the user browses the list.
+struct TreatmentChemicalPicker: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var selectedChemical: String
+    var onSelect: ((String) -> Void)?
+    
+    var body: some View {
+        NavigationView {
+            List {
+                ForEach(ChemicalData.byCategory, id: \.category) { group in
+                    Section(header: Text(group.category.rawValue)) {
+                        ForEach(group.chemicals) { chem in
+                            Button(action: {
+                                selectedChemical = chem.name
+                                onSelect?(chem.name)
+                                dismiss()
+                            }) {
+                                HStack {
+                                    Text(chem.name)
+                                        .foregroundColor(.primary)
+                                    Spacer()
+                                    if selectedChemical == chem.name {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.accentColor)
+                                            .fontWeight(.semibold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Select Chemical")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Treatment Unit Picker (Sheet)
+/// Dedicated sheet for dose unit selection — prevents FAB overlap on phones.
+struct TreatmentUnitPicker: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var selectedUnit: DoseUnit
+    
+    var body: some View {
+        NavigationView {
+            List {
+                ForEach(DoseUnit.allCases) { unit in
+                    Button(action: {
+                        selectedUnit = unit
+                        dismiss()
+                    }) {
+                        HStack {
+                            Text(unit.rawValue)
+                                .foregroundColor(.primary)
+                            Spacer()
+                            if selectedUnit == unit {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.accentColor)
+                                    .fontWeight(.semibold)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Select Unit")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 #Preview { FieldMapView() }

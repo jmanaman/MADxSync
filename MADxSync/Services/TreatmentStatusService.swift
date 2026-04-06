@@ -234,7 +234,12 @@ class TreatmentStatusService: ObservableObject {
     
     /// Pull treatment_status table from Supabase.
     /// HARDENED: Skips network request when offline — uses cached data instead.
-    func syncFromHub() async {
+    ///
+    /// EGRESS OPTIMIZATION (2026-03-17):
+    /// When `since` is provided, only fetches rows updated after that timestamp.
+    /// Returns a small delta (usually 0-2 rows) instead of the full 12K+ table.
+    /// When `since` is nil, does a full pull (first load or wake from background).
+    func syncFromHub(since: String? = nil) async {
         // Network guard — don't fire a doomed request when offline
         guard NetworkMonitor.shared.hasInternet else {
             print("[TreatmentStatus] Sync skipped — no internet, using cached data (\(statusByFeature.count) statuses)")
@@ -245,8 +250,21 @@ class TreatmentStatusService: ObservableObject {
         isLoading = true
         lastError = nil
         
-        guard let districtId = AuthService.shared.districtId,
-              let url = URL(string: "\(supabaseURL)/rest/v1/treatment_status?district_id=eq.\(districtId)&select=*") else {
+        guard let districtId = AuthService.shared.districtId else {
+            lastError = "No district ID"
+            isLoading = false
+            return
+        }
+        
+        // Build URL — with optional conditional filter
+        var urlString = "\(supabaseURL)/rest/v1/treatment_status?district_id=eq.\(districtId)&select=*"
+        if let since = since {
+            // Conditional fetch: only rows updated since last sync
+            let encoded = since.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? since
+            urlString += "&updated_at=gt.\(encoded)"
+        }
+        
+        guard let url = URL(string: urlString) else {
             lastError = "Invalid URL"
             isLoading = false
             return
@@ -283,7 +301,7 @@ class TreatmentStatusService: ObservableObject {
                 let refreshed = await AuthService.shared.handleUnauthorized()
                 if refreshed {
                     isLoading = false
-                    await syncFromHub()  // Retry with fresh token
+                    await syncFromHub(since: since)  // Retry with fresh token
                     return
                 }
                 lastError = "Authentication failed"
@@ -302,13 +320,44 @@ class TreatmentStatusService: ObservableObject {
             let decoder = JSONDecoder()
             let statuses = try decoder.decode([HubTreatmentStatus].self, from: data)
             
-            // Build lookup dictionary
-            var lookup: [String: HubTreatmentStatus] = [:]
-            for status in statuses {
-                lookup[status.feature_id] = status
+            let isConditional = since != nil
+            
+            if isConditional && statuses.isEmpty {
+                // Nothing changed since last sync — no work to do
+                lastSync = Date()
+                isLoading = false
+                await pushPendingCycleUpdates()
+                return
             }
             
-            // Only update if data actually changed (avoid unnecessary map rebuilds)
+            if isConditional {
+                // DELTA MERGE: update only the changed rows in existing state
+                var updated = false
+                for status in statuses {
+                    let existing = statusByFeature[status.feature_id]
+                    if existing?.color != status.color ||
+                       existing?.days_since != status.days_since ||
+                       existing?.cycle_days != status.cycle_days {
+                        updated = true
+                    }
+                    statusByFeature[status.feature_id] = status
+                }
+                
+                lastSync = Date()
+                saveToCache()
+                cleanupOverrides()
+                
+                if updated {
+                    statusVersion += 1
+                    print("[TreatmentStatus] Delta sync: \(statuses.count) updated rows (v\(statusVersion))")
+                }
+            } else {
+                // FULL REPLACE: first load or wake from background
+                var lookup: [String: HubTreatmentStatus] = [:]
+                for status in statuses {
+                    lookup[status.feature_id] = status
+                }
+                
                 let dataChanged = lookup.count != statusByFeature.count ||
                     lookup.contains { key, value in
                         statusByFeature[key]?.color != value.color ||
@@ -319,14 +368,13 @@ class TreatmentStatusService: ObservableObject {
                 statusByFeature = lookup
                 lastSync = Date()
                 saveToCache()
-                        
-                // Clear local overrides that the Hub has now picked up
                 cleanupOverrides()
                         
                 if dataChanged {
-                    statusVersion += 1  // Trigger map overlay rebuild
-                    print("[TreatmentStatus] Synced \(statuses.count) feature statuses from Hub (v\(statusVersion)) — data changed")
+                    statusVersion += 1
+                    print("[TreatmentStatus] Full sync: \(statuses.count) statuses (v\(statusVersion)) — data changed")
                 }
+            }
             
             // Push any pending cycle updates after successful sync
             await pushPendingCycleUpdates()
