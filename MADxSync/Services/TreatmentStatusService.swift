@@ -68,8 +68,8 @@ class TreatmentStatusService: ObservableObject {
     
     // MARK: - Configuration
     
-    private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
-    private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
+    private let supabaseURL = SupabaseConfig.url
+    private let supabaseKey = SupabaseConfig.publishableKey
     
     // Cache keys
     private let cacheKeyStatus = "treatment_status_cache"
@@ -234,12 +234,14 @@ class TreatmentStatusService: ObservableObject {
     
     /// Pull treatment_status table from Supabase.
     /// HARDENED: Skips network request when offline — uses cached data instead.
+    /// HARDENED: 2026-04 — retryCount prevents infinite recursion if token refresh
+    /// succeeds but the new token is also rejected (e.g., RLS policy issue).
     ///
     /// EGRESS OPTIMIZATION (2026-03-17):
     /// When `since` is provided, only fetches rows updated after that timestamp.
     /// Returns a small delta (usually 0-2 rows) instead of the full 12K+ table.
     /// When `since` is nil, does a full pull (first load or wake from background).
-    func syncFromHub(since: String? = nil) async {
+    func syncFromHub(since: String? = nil, retryCount: Int = 0) async {
         // Network guard — don't fire a doomed request when offline
         guard NetworkMonitor.shared.hasInternet else {
             print("[TreatmentStatus] Sync skipped — no internet, using cached data (\(statusByFeature.count) statuses)")
@@ -296,13 +298,17 @@ class TreatmentStatusService: ObservableObject {
                 return
             }
             
-            // Handle 401 — attempt token refresh
+            // Handle 401 — attempt token refresh (max 1 retry to prevent infinite recursion)
             if httpResponse.statusCode == 401 {
-                let refreshed = await AuthService.shared.handleUnauthorized()
-                if refreshed {
-                    isLoading = false
-                    await syncFromHub(since: since)  // Retry with fresh token
-                    return
+                if retryCount < 1 {
+                    let refreshed = await AuthService.shared.handleUnauthorized()
+                    if refreshed {
+                        isLoading = false
+                        await syncFromHub(since: since, retryCount: retryCount + 1)
+                        return
+                    }
+                } else {
+                    print("[TreatmentStatus] ⚠️ 401 persists after token refresh — not retrying again")
                 }
                 lastError = "Authentication failed"
                 isLoading = false

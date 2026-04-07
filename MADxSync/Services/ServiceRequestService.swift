@@ -35,8 +35,8 @@ final class ServiceRequestService: ObservableObject {
     
     // MARK: - Configuration
     
-    private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
-    private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
+    private let supabaseURL = SupabaseConfig.url
+    private let supabaseKey = SupabaseConfig.publishableKey
     private let requestTimeout: TimeInterval = 15.0
     
     // MARK: - Local Storage

@@ -53,9 +53,7 @@ struct FieldMapView: View {
     @State private var treatmentFamily: TreatmentFamily = .field
     @State private var treatmentStatus: TreatmentStatus = .treated
     @State private var applicationMethod: ApplicationMethod = .truck
-    @State private var selectedChemical: String = "BTI Sand"
-    @State private var doseValue: Double = 4.0
-    @State private var doseUnit: DoseUnit = .oz
+    @State private var productRows: [ProductRowState] = [ProductRowState()]
     @State private var showLarvaePicker = false
     @State private var pendingLarvaeCoordinate: CLLocationCoordinate2D?
     @State private var showNotePicker = false
@@ -71,7 +69,7 @@ struct FieldMapView: View {
     @State private var snapSourceName: String = ""
     @State private var mapRefreshTrigger: Int = 0
     @State private var showRoutePolyline: Bool = false
-    @FocusState private var doseFieldFocused: Bool
+    @FocusState private var focusedDoseRowId: UUID?
     
     var body: some View {
         ZStack {
@@ -241,6 +239,13 @@ struct FieldMapView: View {
             SnapToastView(sourceName: snapSourceName, isVisible: showSnapToast)
                 .allowsHitTesting(false)
         }
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") { focusedDoseRowId = nil }
+                    .fontWeight(.semibold)
+            }
+        }
         .onAppear {
             navigationService.requestPermission()
             routeService.setNavigationService(navigationService)
@@ -329,8 +334,8 @@ struct FieldMapView: View {
     // MARK: - Handle Map Tap
     private func handleMapTap(_ coordinate: CLLocationCoordinate2D, screenPoint: CGPoint) {
         // If the dose keyboard is up, dismiss it instead of dropping a marker
-        if doseFieldFocused {
-            doseFieldFocused = false
+        if focusedDoseRowId != nil {
+            focusedDoseRowId = nil
             return
         }
         
@@ -531,14 +536,31 @@ struct FieldMapView: View {
             }
             
             // 4. Create marker with snapped coordinate and feature info
+            // Commit any in-progress dose text before reading values
+            for i in productRows.indices {
+                productRows[i].commitDoseText()
+            }
+            // Build products array from context strip loadout
+            let products = productRows.map { row in
+                ProductRecord(
+                    chemical: row.chemical,
+                    doseValue: row.doseValue,
+                    doseUnit: row.doseUnit.rawValue
+                )
+            }
+            
+            // Primary product goes in flat fields for backward compat
+            let primary = products.first
+            
             let marker = FieldMarker(
                 lat: finalCoordinate.latitude,
                 lon: finalCoordinate.longitude,
                 family: treatmentFamily.rawValue,
                 status: treatmentStatus.rawValue,
-                chemical: selectedChemical,
-                doseValue: doseValue,
-                doseUnit: doseUnit.rawValue,
+                chemical: primary?.chemical,
+                doseValue: primary?.doseValue,
+                doseUnit: primary?.doseUnit,
+                products: products.count > 1 ? products : nil,
                 featureId: featureId,
                 featureType: featureType,
                 applicationMethod: treatmentStatus == .treated ? applicationMethod.rawValue : nil
@@ -549,7 +571,7 @@ struct FieldMapView: View {
             // 5. Optimistic local treatment status update
             if treatmentStatus == .treated || treatmentStatus == .observed {
                 if let fId = featureId, let fType = featureType {
-                    treatmentStatusService.markTreatedLocally(featureId: fId, featureType: fType, chemical: selectedChemical)
+                    treatmentStatusService.markTreatedLocally(featureId: fId, featureType: fType, chemical: productRows.first?.chemical)
                     treatedFeatureStack.append(fId)
                 } else {
                     treatedFeatureStack.append("")
@@ -634,8 +656,8 @@ struct FieldMapView: View {
     }
     
     // MARK: - Dose Presets
-    private var dosePresetsForUnit: [Double] {
-        switch doseUnit {
+    private func dosePresetsForUnit(_ unit: DoseUnit) -> [Double] {
+        switch unit {
         case .oz, .flOz: return [0.5, 1, 2, 4, 8]
         case .gal: return [0.25, 0.5, 1, 2]
         case .briq: return [1, 2, 4]
@@ -652,9 +674,36 @@ struct FieldMapView: View {
     // MARK: - Treatment Context Strip
     @State private var showChemicalSheet = false
     @State private var showUnitSheet = false
+    @State private var editingProductRowId: UUID?   // Which row opened the picker
+    
+    /// Mutable state for one product slot in the context strip.
+    /// Persists across taps — the tech's "loadout."
+    /// doseText is the string the TextField edits directly — isolated from
+    /// SwiftUI re-renders caused by FLO GPS ticks. doseValue is the numeric
+    /// truth written to the marker on tap.
+    struct ProductRowState: Identifiable {
+        let id = UUID()
+        var chemical: String = "BTI Sand"
+        var doseValue: Double = 4.0
+        var doseUnit: DoseUnit = .oz
+        var doseText: String = "4"
+        
+        /// Sync doseText → doseValue. Called when field loses focus or preset tapped.
+        mutating func commitDoseText() {
+            if let parsed = Double(doseText) {
+                doseValue = parsed
+            }
+        }
+        
+        /// Sync doseValue → doseText. Called when presets or chemical auto-defaults set the value.
+        mutating func syncTextFromValue() {
+            doseText = doseValue == floor(doseValue) ? String(format: "%.0f", doseValue) : String(doseValue)
+        }
+    }
     
     private var treatmentContextStrip: some View {
         VStack(spacing: 10) {
+            // Row 1: Family picker + Treated/Observed toggle
             HStack {
                 Picker("", selection: $treatmentFamily) {
                     ForEach(TreatmentFamily.allCases) { f in
@@ -676,6 +725,8 @@ struct FieldMapView: View {
                         .cornerRadius(8)
                 }
             }
+            
+            // Row 2: Application method (only when treated)
             if treatmentStatus == .treated {
                 Picker("", selection: $applicationMethod) {
                     ForEach(ApplicationMethod.allCases) { m in
@@ -684,84 +735,209 @@ struct FieldMapView: View {
                 }
                 .pickerStyle(.segmented)
             }
-            HStack(spacing: 10) {
-                // Chemical picker — opens as sheet to avoid scroll-rewind from parent re-renders
-                Button(action: { showChemicalSheet = true }) {
-                    HStack(spacing: 4) {
-                        Text(selectedChemical).font(.subheadline).lineLimit(1).frame(maxWidth: 140, alignment: .leading)
-                        Image(systemName: "chevron.down").font(.caption2)
-                    }
-                    .padding(.horizontal, 10).padding(.vertical, 8)
-                    .background(Color(.secondarySystemBackground)).cornerRadius(8)
+            
+            // Product rows — each has chemical + dose + unit + its own presets
+            ForEach($productRows) { $row in
+                VStack(spacing: 6) {
+                    productRowView(row: $row)
+                    dosePresetRow(for: row)
                 }
-                .foregroundColor(.primary)
-                TextField("0", value: $doseValue, format: .number)
-                    .keyboardType(.decimalPad)
-                    .focused($doseFieldFocused)
-                    .font(.system(.body, design: .monospaced))
-                    .frame(width: 60).multilineTextAlignment(.center)
-                    .padding(.vertical, 6).background(Color(.secondarySystemBackground)).cornerRadius(6)
-                    .toolbar {
-                        ToolbarItemGroup(placement: .keyboard) {
-                            Spacer()
-                            Button("Done") { doseFieldFocused = false }
-                                .fontWeight(.semibold)
-                        }
-                    }
-                // Unit picker — sheet to avoid FAB overlap on phones
-                Button(action: { showUnitSheet = true }) {
-                    Text(doseUnit.rawValue).font(.subheadline)
-                        .padding(.horizontal, 10).padding(.vertical, 8)
-                        .background(Color(.secondarySystemBackground)).cornerRadius(6)
-                }
-                .foregroundColor(.primary)
-                Spacer() // Absorbs right side — keeps controls clear of FAB column
             }
-            HStack(spacing: 6) {
-                ForEach(dosePresetsForUnit, id: \.self) { preset in
-                    Button(action: { doseValue = preset }) {
-                        Text(formatPreset(preset))
-                            .font(.caption.monospacedDigit())
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                            .background(doseValue == preset ? Color.blue.opacity(0.3) : Color(.tertiarySystemBackground))
-                            .foregroundColor(doseValue == preset ? .blue : .primary)
-                            .cornerRadius(6)
+            
+            // Add product button (max 4 — relay 1, relay 2, hand product, edge case)
+            if treatmentStatus == .treated && productRows.count < 4 {
+                Button(action: { addProductRow() }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.subheadline)
+                        Text("Add Product")
+                            .font(.caption.bold())
                     }
-                    .buttonStyle(.plain)
+                    .foregroundColor(.blue)
+                    .padding(.vertical, 4)
                 }
-                Spacer()
             }
         }
         .padding(12)
         .background(.ultraThinMaterial)
         .sheet(isPresented: $showChemicalSheet) {
-            TreatmentChemicalPicker(selectedChemical: $selectedChemical) { chemName in
-                updateUnitForChemical(chemName)
+            TreatmentChemicalPicker(
+                selectedChemical: bindingForEditingRowChemical()
+            ) { chemName in
+                if let rowId = editingProductRowId,
+                   let idx = productRows.firstIndex(where: { $0.id == rowId }) {
+                    updateUnitForChemical(chemName, rowIndex: idx)
+                }
             }
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showUnitSheet) {
-            TreatmentUnitPicker(selectedUnit: $doseUnit)
-                .presentationDetents([.medium])
-                .presentationDragIndicator(.visible)
+            TreatmentUnitPicker(
+                selectedUnit: bindingForEditingRowUnit()
+            )
+            .presentationDetents([.medium])
+            .presentationDragIndicator(.visible)
         }
+    }
+    
+    // MARK: - Single Product Row View
+    @ViewBuilder
+    private func productRowView(row: Binding<ProductRowState>) -> some View {
+        HStack(spacing: 8) {
+            // Remove button (only show if more than one row)
+            if productRows.count > 1 {
+                Button(action: { removeProductRow(id: row.wrappedValue.id) }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.subheadline)
+                        .foregroundColor(.red.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+            }
+            
+            // Chemical picker button
+            Button(action: {
+                editingProductRowId = row.wrappedValue.id
+                showChemicalSheet = true
+            }) {
+                HStack(spacing: 4) {
+                    Text(row.wrappedValue.chemical)
+                        .font(.subheadline)
+                        .lineLimit(1)
+                        .frame(maxWidth: 130, alignment: .leading)
+                    Image(systemName: "chevron.down").font(.caption2)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground)).cornerRadius(8)
+            }
+            .foregroundColor(.primary)
+            
+            // Dose value — bound to doseText (String) to prevent FLO GPS tick
+            // re-renders from snapping the field back while the user is typing.
+            // The numeric doseValue is committed when focus leaves the field.
+            TextField("0", text: row.doseText)
+                .keyboardType(.decimalPad)
+                .focused($focusedDoseRowId, equals: row.wrappedValue.id)
+                .font(.system(.body, design: .monospaced))
+                .frame(width: 55).multilineTextAlignment(.center)
+                .padding(.vertical, 6)
+                .background(Color(.secondarySystemBackground)).cornerRadius(6)
+                .onChange(of: focusedDoseRowId) { newFocus in
+                    // When this row loses focus, commit the text to the numeric value
+                    if newFocus != row.wrappedValue.id {
+                        if let idx = productRows.firstIndex(where: { $0.id == row.wrappedValue.id }) {
+                            productRows[idx].commitDoseText()
+                        }
+                    }
+                }
+            
+            // Unit picker button
+            Button(action: {
+                editingProductRowId = row.wrappedValue.id
+                showUnitSheet = true
+            }) {
+                Text(row.wrappedValue.doseUnit.rawValue).font(.subheadline)
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .background(Color(.secondarySystemBackground)).cornerRadius(6)
+            }
+            .foregroundColor(.primary)
+            
+            Spacer()
+        }
+    }
+    
+    // MARK: - Dose Preset Row
+    @ViewBuilder
+    private func dosePresetRow(for row: ProductRowState) -> some View {
+        let presets = dosePresetsForUnit(row.doseUnit)
+        HStack(spacing: 6) {
+            ForEach(presets, id: \.self) { preset in
+                Button(action: {
+                    if let idx = productRows.firstIndex(where: { $0.id == row.id }) {
+                        productRows[idx].doseValue = preset
+                        productRows[idx].syncTextFromValue()
+                    }
+                }) {
+                    Text(formatPreset(preset))
+                        .font(.caption.monospacedDigit())
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(row.doseValue == preset ? Color.blue.opacity(0.3) : Color(.tertiarySystemBackground))
+                        .foregroundColor(row.doseValue == preset ? .blue : .primary)
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+    }
+    
+    // MARK: - Product Row Helpers
+    
+    private func addProductRow() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            productRows.append(ProductRowState())
+        }
+    }
+    
+    private func removeProductRow(id: UUID) {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            productRows.removeAll { $0.id == id }
+        }
+    }
+    
+    /// Binding proxy for the chemical picker sheet — routes to whichever row triggered it
+    private func bindingForEditingRowChemical() -> Binding<String> {
+        Binding<String>(
+            get: {
+                guard let rowId = editingProductRowId,
+                      let idx = productRows.firstIndex(where: { $0.id == rowId }) else {
+                    return productRows.first?.chemical ?? "BTI Sand"
+                }
+                return productRows[idx].chemical
+            },
+            set: { newValue in
+                guard let rowId = editingProductRowId,
+                      let idx = productRows.firstIndex(where: { $0.id == rowId }) else { return }
+                productRows[idx].chemical = newValue
+            }
+        )
+    }
+    
+    /// Binding proxy for the unit picker sheet — routes to whichever row triggered it
+    private func bindingForEditingRowUnit() -> Binding<DoseUnit> {
+        Binding<DoseUnit>(
+            get: {
+                guard let rowId = editingProductRowId,
+                      let idx = productRows.firstIndex(where: { $0.id == rowId }) else {
+                    return productRows.first?.doseUnit ?? .oz
+                }
+                return productRows[idx].doseUnit
+            },
+            set: { newValue in
+                guard let rowId = editingProductRowId,
+                      let idx = productRows.firstIndex(where: { $0.id == rowId }) else { return }
+                productRows[idx].doseUnit = newValue
+            }
+        )
     }
     
     private func formatPreset(_ value: Double) -> String {
         value == floor(value) ? String(format: "%.0f", value) : String(format: "%.2g", value)
     }
     
-    private func updateUnitForChemical(_ chemName: String) {
+    private func updateUnitForChemical(_ chemName: String, rowIndex: Int) {
+        guard rowIndex < productRows.count else { return }
         let name = chemName.lowercased()
-        if name.contains("fish") { doseUnit = .each; doseValue = 25 }
-        else if name.contains("briq") || name.contains("altosid sr") { doseUnit = .briq; doseValue = 1 }
-        else if name.contains("pouch") || name.contains("natular") { doseUnit = .pouch; doseValue = 1 }
-        else if name.contains("wsp") || name.contains("packet") { doseUnit = .packet; doseValue = 1 }
-        else if name.contains("tablet") || name.contains("dt") { doseUnit = .tablet; doseValue = 1 }
-        else if name.contains("oil") || name.contains("agnique") || name.contains("mmf") { doseUnit = .gal; doseValue = 0.5 }
-        else if name.contains("sand") || name.contains("gs") || name.contains("fg") || name.contains("g30") { doseUnit = .lb; doseValue = 1 }
-        else { doseUnit = .oz; doseValue = 4 }
+        if name.contains("fish") { productRows[rowIndex].doseUnit = .each; productRows[rowIndex].doseValue = 25 }
+        else if name.contains("briq") || name.contains("altosid sr") { productRows[rowIndex].doseUnit = .briq; productRows[rowIndex].doseValue = 1 }
+        else if name.contains("pouch") || name.contains("natular") { productRows[rowIndex].doseUnit = .pouch; productRows[rowIndex].doseValue = 1 }
+        else if name.contains("wsp") || name.contains("packet") { productRows[rowIndex].doseUnit = .packet; productRows[rowIndex].doseValue = 1 }
+        else if name.contains("tablet") || name.contains("dt") { productRows[rowIndex].doseUnit = .tablet; productRows[rowIndex].doseValue = 1 }
+        else if name.contains("oil") || name.contains("agnique") || name.contains("mmf") { productRows[rowIndex].doseUnit = .gal; productRows[rowIndex].doseValue = 0.5 }
+        else if name.contains("sand") || name.contains("gs") || name.contains("fg") || name.contains("g30") { productRows[rowIndex].doseUnit = .lb; productRows[rowIndex].doseValue = 1 }
+        else { productRows[rowIndex].doseUnit = .oz; productRows[rowIndex].doseValue = 4 }
+        // Keep doseText in sync with the auto-default value
+        productRows[rowIndex].syncTextFromValue()
     }
     
     // MARK: - Tool FAB Column

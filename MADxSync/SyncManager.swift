@@ -35,8 +35,8 @@ class SyncManager: ObservableObject {
     
     // MARK: - Configuration
     // NOTE: floBaseURL removed — all FLO communication now goes through FLOService.
-    private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
-    private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
+    private let supabaseURL = SupabaseConfig.url
+    private let supabaseKey = SupabaseConfig.publishableKey
     
     // MARK: - Local Storage
     private var pendingData: [PendingSync] = []
@@ -202,8 +202,21 @@ class SyncManager: ObservableObject {
             let tableName = file.name.contains(".manual") ? "viewer_logs" : "source_logs"
             
             // Store locally for upload — stamp with compound identifier
+            // SAFETY: Guard against nil equipment code. The hasEquipmentSelected guard at the
+            // top of sync() should prevent this, but equipment could be cleared by a reactive
+            // SwiftUI update between the guard and here. Log the anomaly and use a traceable fallback.
+            let truckIdForSync: String
+            if let opId = EquipmentService.shared.operatorIdentifier {
+                truckIdForSync = opId
+            } else if let eqCode = EquipmentService.shared.selectedEquipmentCode {
+                truckIdForSync = eqCode
+            } else {
+                log("⚠️ Equipment cleared mid-sync — stamping as UNKNOWN")
+                truckIdForSync = "UNKNOWN"
+            }
+            
             let pending = PendingSync(
-                truckId: EquipmentService.shared.operatorIdentifier ?? EquipmentService.shared.selectedEquipmentCode!,
+                truckId: truckIdForSync,
                 fileName: file.name,
                 tableName: tableName,
                 rows: rows,

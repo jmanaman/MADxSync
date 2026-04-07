@@ -29,6 +29,12 @@
 import Foundation
 import Combine
 
+// HARDENED: 2026-04 — Added @MainActor isolation.
+// Timer callbacks fire on the main RunLoop and mutate internal state (channelBusy, isDark,
+// lastUserActivity, failureCount). Without @MainActor, the Task {} blocks spawned by
+// timer callbacks could race on these dictionaries. @MainActor ensures all property
+// access is serialized on the main actor, matching the Timer's execution context.
+@MainActor
 final class HubSyncService: ObservableObject {
     
     static let shared = HubSyncService()
@@ -57,8 +63,8 @@ final class HubSyncService: ObservableObject {
     private let requestTimeout: TimeInterval = 15.0
     
     /// Supabase project credentials (same for all districts — project-level, not district-level)
-    private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
-    private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
+    private let supabaseURL = SupabaseConfig.url
+    private let supabaseKey = SupabaseConfig.publishableKey
     
     // MARK: - State
     
@@ -114,12 +120,18 @@ final class HubSyncService: ObservableObject {
         pollSlowChannels()
         
         // Start timers
+        // Timer callbacks fire on the main RunLoop. Since HubSyncService is @MainActor,
+        // we need to hop to MainActor explicitly from the closure.
         fastTimer = Timer.scheduledTimer(withTimeInterval: fastInterval, repeats: true) { [weak self] _ in
-            self?.fastTick()
+            Task { @MainActor [weak self] in
+                self?.fastTick()
+            }
         }
         
         slowTimer = Timer.scheduledTimer(withTimeInterval: slowInterval, repeats: true) { [weak self] _ in
-            self?.slowTick()
+            Task { @MainActor [weak self] in
+                self?.slowTick()
+            }
         }
     }
     

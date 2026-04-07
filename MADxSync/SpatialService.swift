@@ -32,8 +32,8 @@ class SpatialService: ObservableObject {
     private let refreshInterval: TimeInterval = 3600  // 1 hour — matches Hub refresh
     
     // MARK: - Configuration
-    private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
-    private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
+    private let supabaseURL = SupabaseConfig.url
+    private let supabaseKey = SupabaseConfig.publishableKey
     private var districtId: String {
         AuthService.shared.districtId ?? ""
     }
@@ -189,8 +189,14 @@ class SpatialService: ObservableObject {
     // MARK: - Generic Supabase Fetch
     
     private func fetchFromSupabase<T: Decodable>(table: String, type: T.Type) async -> (T, String?) where T: Collection {
+        // Construct a typed empty collection for error returns.
+        // JSONDecoder on "[]" always succeeds for Array<Decodable> types — this replaces
+        // the old `[] as! T` force casts which relied on runtime downcast resolution.
+        // SAFETY: This decode cannot fail because "[]" is valid JSON for any array type.
+        let empty = (try? JSONDecoder().decode(type, from: Data("[]".utf8)))!
+        
         guard let url = URL(string: "\(supabaseURL)/rest/v1/\(table)?district_id=eq.\(districtId)&select=*") else {
-            return ([] as! T, "Invalid URL")
+            return (empty, "Invalid URL")
         }
         
         var request = URLRequest(url: url)
@@ -206,13 +212,13 @@ class SpatialService: ObservableObject {
             let (data, response) = try await URLSession.shared.data(for: request)
             
             guard let httpResponse = response as? HTTPURLResponse else {
-                return ([] as! T, "No response")
+                return (empty, "No response")
             }
             
             guard httpResponse.statusCode == 200 else {
                 let body = String(data: data, encoding: .utf8) ?? "no body"
                 print("[SpatialService] Error fetching \(table): \(httpResponse.statusCode) - \(body)")
-                return ([] as! T, "HTTP \(httpResponse.statusCode)")
+                return (empty, "HTTP \(httpResponse.statusCode)")
             }
             
             let decoder = JSONDecoder()
@@ -221,7 +227,7 @@ class SpatialService: ObservableObject {
             
         } catch {
             print("[SpatialService] Fetch error for \(table): \(error)")
-            return ([] as! T, error.localizedDescription)
+            return (empty, error.localizedDescription)
         }
     }
     

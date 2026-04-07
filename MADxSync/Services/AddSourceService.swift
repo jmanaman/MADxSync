@@ -66,8 +66,8 @@ class AddSourceService: ObservableObject {
     @Published var lastSyncError: String?
     
     // MARK: - Configuration
-    private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
-    private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
+    private let supabaseURL = SupabaseConfig.url
+    private let supabaseKey = SupabaseConfig.publishableKey
     
     // MARK: - Local Storage
     private let sourcesFileURL: URL

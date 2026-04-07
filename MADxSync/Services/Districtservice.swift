@@ -75,8 +75,8 @@ class DistrictService: ObservableObject {
     private let defaultDistrictId = "2f05ab6e-dacb-4af5-b5d2-0156aa8b58ce"
     
     // Supabase config
-    private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
-    private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
+    private let supabaseURL = SupabaseConfig.url
+    private let supabaseKey = SupabaseConfig.publishableKey
     
     // Cache
     private let cacheDir: URL

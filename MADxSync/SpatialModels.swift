@@ -14,12 +14,23 @@ import Combine
 
 // MARK: - GeoJSON Geometry Types
 
+// HARDENED: 2026-04 — All coordinate access is bounds-checked.
+// A single malformed row in Supabase (e.g. empty coordinates array from a bad GIS import)
+// would previously crash the entire spatial layer load via index-out-of-bounds.
+// Now: malformed coordinates are silently dropped, remaining features still render.
+
+/// Safely extract [lon, lat] → CLLocationCoordinate2D. Returns nil if < 2 elements.
+private func safeCoordinate(_ pair: [Double]) -> CLLocationCoordinate2D? {
+    guard pair.count >= 2 else { return nil }
+    return CLLocationCoordinate2D(latitude: pair[1], longitude: pair[0])
+}
+
 struct GeoJSONPoint: Codable {
     let type: String
     let coordinates: [Double]
     
-    var coordinate: CLLocationCoordinate2D {
-        CLLocationCoordinate2D(latitude: coordinates[1], longitude: coordinates[0])
+    var coordinate: CLLocationCoordinate2D? {
+        safeCoordinate(coordinates)
     }
 }
 
@@ -28,7 +39,7 @@ struct GeoJSONLineString: Codable {
     let coordinates: [[Double]]
     
     var coordinates2D: [CLLocationCoordinate2D] {
-        coordinates.map { CLLocationCoordinate2D(latitude: $0[1], longitude: $0[0]) }
+        coordinates.compactMap { safeCoordinate($0) }
     }
 }
 
@@ -39,7 +50,7 @@ struct GeoJSONPolygon: Codable {
     // Returns outer ring only (first array)
     var outerRing: [CLLocationCoordinate2D] {
         guard let ring = coordinates.first else { return [] }
-        return ring.map { CLLocationCoordinate2D(latitude: $0[1], longitude: $0[0]) }
+        return ring.compactMap { safeCoordinate($0) }
     }
 }
 
@@ -49,7 +60,7 @@ struct GeoJSONMultiLineString: Codable {
     
     var lines: [[CLLocationCoordinate2D]] {
         coordinates.map { line in
-            line.map { CLLocationCoordinate2D(latitude: $0[1], longitude: $0[0]) }
+            line.compactMap { safeCoordinate($0) }
         }
     }
 }
@@ -60,7 +71,7 @@ struct GeoJSONMultiPolygon: Codable {
     
     var polygons: [[CLLocationCoordinate2D]] {
         coordinates.compactMap { polygon in
-            polygon.first?.map { CLLocationCoordinate2D(latitude: $0[1], longitude: $0[0]) }
+            polygon.first?.compactMap { safeCoordinate($0) }
         }
     }
 }

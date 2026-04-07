@@ -81,6 +81,27 @@ enum DoseUnit: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+// MARK: - Product Record
+/// A single product applied during a treatment.
+/// Multiple products per marker when tech uses dual relay or mixed applications.
+///
+/// ADDED: 2026-04 — Multi-product context strip support.
+/// The context strip loadout can hold N product rows. Each diamond tap
+/// stamps all of them into a single marker via the products array.
+struct ProductRecord: Codable, Identifiable, Hashable {
+    let id: UUID
+    var chemical: String
+    var doseValue: Double
+    var doseUnit: String
+    
+    init(chemical: String = "BTI Sand", doseValue: Double = 4.0, doseUnit: String = "oz") {
+        self.id = UUID()
+        self.chemical = chemical
+        self.doseValue = doseValue
+        self.doseUnit = doseUnit
+    }
+}
+
 // MARK: - Treatment Family
 /// Treatment location categories (determines diamond color)
 enum TreatmentFamily: String, CaseIterable, Identifiable {
@@ -183,6 +204,11 @@ enum ApplicationMethod: String, CaseIterable, Identifiable {
 /// When a treatment diamond is dropped near a canal, the app snaps to the nearest
 /// point on the line and stores the polyline's ID here. The HUB uses this for
 /// direct feature matching instead of spatial proximity.
+///
+/// UPDATED: 2026-04 — Added products array for multi-product treatments.
+/// Single-product markers use flat chemical/doseValue/doseUnit fields (backward compat).
+/// Multi-product markers additionally populate the products array and serialize to
+/// products_json in Supabase. Hub reads products_json when present, falls back to flat fields.
 struct FieldMarker: Identifiable, Codable {
     let id: UUID
     let timestamp: Date
@@ -192,9 +218,10 @@ struct FieldMarker: Identifiable, Codable {
     // Treatment data
     var family: String?          // FIELD, POOL, DRAIN, TRAP, MISC
     var status: String?          // TREATED, OBSERVED
-    var chemical: String?
-    var doseValue: Double?
-    var doseUnit: String?
+    var chemical: String?        // Primary product (backward compat — always first product)
+    var doseValue: Double?       // Primary dose (backward compat)
+    var doseUnit: String?        // Primary unit (backward compat)
+    var products: [ProductRecord]?  // Full product list when 2+ products applied
     var trapNumber: String?
     
     // Larvae data
@@ -226,6 +253,7 @@ struct FieldMarker: Identifiable, Codable {
         chemical: String? = nil,
         doseValue: Double? = nil,
         doseUnit: String? = nil,
+        products: [ProductRecord]? = nil,
         trapNumber: String? = nil,
         larvae: String? = nil,
         pupaePresent: Bool = false,
@@ -244,6 +272,7 @@ struct FieldMarker: Identifiable, Codable {
         self.chemical = chemical
         self.doseValue = doseValue
         self.doseUnit = doseUnit
+        self.products = products
         self.trapNumber = trapNumber
         self.larvae = larvae
         self.pupaePresent = pupaePresent
@@ -303,6 +332,7 @@ struct FieldMarker: Identifiable, Codable {
         if let status = status {
             payloadData["status"] = status
         }
+        // Primary product (backward compat — FLO always gets first product in flat fields)
         if let chemical = chemical {
             payloadData["chem"] = chemical
         }
@@ -314,6 +344,14 @@ struct FieldMarker: Identifiable, Codable {
         }
         if let trapNumber = trapNumber {
             payloadData["trapNumber"] = trapNumber
+        }
+        
+        // Multi-product array — only included when 2+ products
+        if let products = products, products.count > 1 {
+            let productDicts = products.map { p -> [String: Any] in
+                ["chem": p.chemical, "doseValue": p.doseValue, "doseUnit": p.doseUnit]
+            }
+            payloadData["products"] = productDicts
         }
         
         // If this is a larvae-only marker
@@ -350,13 +388,26 @@ struct FieldMarker: Identifiable, Codable {
             payload["truck_id"] = truckId
         }
         
-        // Treatment fields
+        // Treatment fields — primary product in flat columns (backward compat)
         if let family = family { payload["family"] = family }
         if let status = status { payload["status"] = status }
         if let chemical = chemical { payload["chemical"] = chemical }
         if let doseValue = doseValue { payload["dose_value"] = doseValue }
         if let doseUnit = doseUnit { payload["dose_unit"] = doseUnit }
         if let trapNumber = trapNumber { payload["trap_number"] = trapNumber }
+        
+        // Multi-product array — JSON-encoded for flexible schema
+        // Only populated when 2+ products. Hub reads this when present,
+        // falls back to flat chemical/dose_value/dose_unit for single-product markers.
+        if let products = products, !products.isEmpty {
+            let productDicts = products.map { p -> [String: Any] in
+                ["chemical": p.chemical, "dose_value": p.doseValue, "dose_unit": p.doseUnit]
+            }
+            if let jsonData = try? JSONSerialization.data(withJSONObject: productDicts),
+               let jsonString = String(data: jsonData, encoding: .utf8) {
+                payload["products_json"] = jsonString
+            }
+        }
         
         // Larvae fields
         if let larvae = larvae { payload["larvae_level"] = larvae }
@@ -405,6 +456,12 @@ struct FieldMarker: Identifiable, Codable {
             if let doseValue = doseValue { action += " doseValue=\(doseValue)" }
             if let doseUnit = doseUnit { action += " doseUnit=\(doseUnit)" }
             if let trapNumber = trapNumber { action += " trapNumber=\(trapNumber)" }
+            // Additional products beyond primary
+            if let products = products, products.count > 1 {
+                for (i, p) in products.dropFirst().enumerated() {
+                    action += " chem\(i+2)=\(p.chemical) doseValue\(i+2)=\(p.doseValue) doseUnit\(i+2)=\(p.doseUnit)"
+                }
+            }
         } else if let larvae = larvae {
             action = "FIELD_LARVA larva=\(larvae) pupae=\(pupaePresent ? 1 : 0)"
         } else if let noteText = noteText {
@@ -451,8 +508,8 @@ class MarkerStore: ObservableObject {
     @Published var lastSyncError: String?
     
     // Supabase config
-    private let supabaseURL = "https://amclxjjsialotyuombxg.supabase.co"
-    private let supabaseKey = "sb_publishable_hefimLQMjSHhL3OQGmzn5g_0wcJMf7L"
+    private let supabaseURL = SupabaseConfig.url
+    private let supabaseKey = SupabaseConfig.publishableKey
     
     // Device identifier (persists across app launches)
     private var deviceId: String {
