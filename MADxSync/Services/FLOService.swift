@@ -275,9 +275,19 @@ class FLOService: ObservableObject {
         }
     }
     
-    /// Poll frequently changing data (GPS, totals, cycle logs)
+    /// Poll frequently changing data (relay status, GPS, totals, cycle logs)
+    ///
+    /// UPDATED 2026-04-10: Added fetchRelayStatus to poll loop.
+    /// Previously relay state was only fetched on initial connect, then
+    /// updated optimistically on UI button taps. This meant TX-triggered
+    /// relay changes were invisible to the app — buttons wouldn't reflect
+    /// hardware state when the operator used the physical transmitter.
+    /// Now the true relay state is read from FLO every poll cycle, so
+    /// buttons stay in sync regardless of whether the command came from
+    /// the app UI or the TX.
     @MainActor
     func pollLiveData() async {
+        await fetchRelayStatus()
         await fetchGPS()
         await fetchTotals()
         await fetchCycleLogs()

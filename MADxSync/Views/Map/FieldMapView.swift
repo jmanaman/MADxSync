@@ -571,7 +571,8 @@ struct FieldMapView: View {
             // 5. Optimistic local treatment status update
             if treatmentStatus == .treated || treatmentStatus == .observed {
                 if let fId = featureId, let fType = featureType {
-                    treatmentStatusService.markTreatedLocally(featureId: fId, featureType: fType, chemical: productRows.first?.chemical)
+                    let chemicalLabel = productRows.map { $0.chemical }.joined(separator: " + ")
+                    treatmentStatusService.markTreatedLocally(featureId: fId, featureType: fType, chemical: chemicalLabel)
                     treatedFeatureStack.append(fId)
                 } else {
                     treatedFeatureStack.append("")
