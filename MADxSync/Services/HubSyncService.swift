@@ -88,6 +88,9 @@ final class HubSyncService: ObservableObject {
     /// Last treatment_status sync timestamp — for conditional fetching
     private var lastTreatmentStatusSync: String?
     
+    /// Last marker_history sync timestamp — for conditional fetching
+    private var lastMarkerHistorySync: String?
+    
     /// Whether the one-time loads (equipment, positions) have completed
     private var oneTimeLoadsComplete = false
     
@@ -116,6 +119,7 @@ final class HubSyncService: ObservableObject {
         
         // Full catch-up fetch on start (coming from background or first launch)
         lastTreatmentStatusSync = nil  // Force full treatment_status pull on wake
+        lastMarkerHistorySync = nil    // Force full marker_history pull on wake
         pollFastChannels()
         pollSlowChannels()
         
@@ -155,6 +159,7 @@ final class HubSyncService: ObservableObject {
         if isDark {
             isDark = false
             lastTreatmentStatusSync = nil  // Force full pull on wake
+            lastMarkerHistorySync = nil    // Force full marker_history pull on wake
             print("[HubSync] Waking from idle-dark — catch-up fetch")
             pollFastChannels()
             pollSlowChannels()
@@ -192,6 +197,7 @@ final class HubSyncService: ObservableObject {
         
         Task { await pullPendingSources() }
         Task { await pullTreatmentStatus() }
+        Task { await pullMarkerHistory() }
         Task { await refreshSpatialIfDue() }
         Task { await pullSourceFinderPins() }
         Task { await pullServiceRequests() }
@@ -404,6 +410,27 @@ final class HubSyncService: ObservableObject {
         
         // Update the sync timestamp for next conditional fetch
         lastTreatmentStatusSync = ISO8601DateFormatter().string(from: Date())
+        recordSuccess(channel)
+    }
+    
+    // MARK: - Channel: Marker History (CONDITIONAL FETCH)
+    
+    private func pullMarkerHistory() async {
+        let channel = "markerHistory"
+        guard !isBusy(channel) else { return }
+        setBusy(channel, true)
+        defer { setBusy(channel, false) }
+        
+        // If we have a last sync time, do conditional fetch (delta only)
+        // Otherwise do a full pull (first load or wake from dark)
+        if let lastSync = lastMarkerHistorySync {
+            await MarkerHistoryService.shared.syncFromHub(since: lastSync)
+        } else {
+            await MarkerHistoryService.shared.syncFromHub(since: nil)
+        }
+        
+        // Update the sync timestamp for next conditional fetch
+        lastMarkerHistorySync = ISO8601DateFormatter().string(from: Date())
         recordSuccess(channel)
     }
     

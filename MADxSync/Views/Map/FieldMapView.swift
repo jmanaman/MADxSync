@@ -2208,6 +2208,7 @@ struct FeatureInfoView: View {
     @ObservedObject var treatmentStatusService = TreatmentStatusService.shared
     @ObservedObject var workingNotesService = WorkingNotesService.shared
     @ObservedObject var sourceNotesService = SourceNotesService.shared
+    @ObservedObject var markerHistoryService = MarkerHistoryService.shared
     @Environment(\.dismiss) var dismiss
     @State private var showCycleConfirm = false
     @State private var pendingCycleDays: Int = 7
@@ -2238,6 +2239,7 @@ struct FeatureInfoView: View {
         NavigationView {
             List {
                 treatmentStatusSection
+                treatmentHistorySection
                 sourceNotesSection
                 cycleDaysSection
                 workingNoteSection
@@ -2342,6 +2344,123 @@ struct FeatureInfoView: View {
             if let chemical = status.lastChemical { infoRow("Chemical", chemical) }
             infoRow("Cycle", "\(status.cycleDays) days")
         }
+    }
+    
+    // MARK: - Treatment History Section (mirrors Hub popup parity)
+    //
+    // Reads from MarkerHistoryService's in-memory cache. Zero network calls
+    // at popup-open time — history is pre-synced by HubSyncService on the
+    // 60s fast-poll cycle. If cache is empty (first install offline, or
+    // district has no markers yet), section is hidden entirely.
+    
+    @ViewBuilder private var treatmentHistorySection: some View {
+        let history = markerHistoryService.historyForFeature(featureId, limit: 10)
+        
+        if !history.isEmpty {
+            Section {
+                ForEach(history, id: \.id) { marker in
+                    treatmentHistoryRow(marker)
+                }
+            } header: {
+                Text("Treatment History (\(history.count))")
+            } footer: {
+                Text("Most recent \(history.count) visits. Full history on Hub.")
+                    .font(.caption2)
+            }
+        }
+    }
+    
+    @ViewBuilder private func treatmentHistoryRow(_ m: AppMarker) -> some View {
+        let (typeLabel, typeHex) = MarkerHistoryService.classifyMarker(m)
+        let eqName = MarkerHistoryService.resolveEquipmentName(m.truck_id)
+        let opName = MarkerHistoryService.resolveOperatorName(m.truck_id)
+        let dateStr = MarkerHistoryService.formatHistoryDate(m.timestamp_iso)
+        
+        VStack(alignment: .leading, spacing: 4) {
+            // Header line: Type — Date
+            HStack(spacing: 6) {
+                Text(typeLabel)
+                    .font(.subheadline.bold())
+                    .foregroundColor(Color(hex: typeHex))
+                Text("—")
+                    .foregroundColor(.secondary)
+                Text(dateStr)
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+            
+            // Equipment / Operator line
+            HStack(spacing: 4) {
+                Text(eqName)
+                    .font(.caption)
+                if let op = opName, !op.isEmpty {
+                    Text("/")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Text(op)
+                        .font(.caption)
+                }
+            }
+            .foregroundColor(.primary)
+            
+            // Products (treatments only)
+            if typeLabel == "Treated" {
+                let products = markerHistoryService.productsForMarker(m)
+                ForEach(Array(products.enumerated()), id: \.offset) { _, p in
+                    HStack(spacing: 4) {
+                        Text("•")
+                            .foregroundColor(.secondary)
+                        Text(p.chemical)
+                            .font(.caption)
+                        if let dv = p.dose_value {
+                            Text("—")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text("\(dv, specifier: "%.2f") \(p.dose_unit ?? "")")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.leading, 4)
+                }
+            }
+            
+            // Larvae/Dip details
+            if typeLabel == "Inspection" || typeLabel == "Dip" {
+                if let larvae = m.larvae_level {
+                    HStack(spacing: 4) {
+                        Text("Larvae:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text(larvae)
+                            .font(.caption)
+                        if m.pupae_present == true {
+                            Text("(pupae)")
+                                .font(.caption)
+                                .foregroundColor(Color(hex: "#06b6d4"))
+                        }
+                    }
+                    .padding(.leading, 4)
+                }
+            }
+            
+            // Standalone pupae marker
+            if typeLabel == "Pupae" && m.marker_type == "PUPAE" {
+                Text("Pupae present")
+                    .font(.caption)
+                    .foregroundColor(Color(hex: "#06b6d4"))
+                    .padding(.leading, 4)
+            }
+            
+            // Application method (if non-default)
+            if let method = m.application_method, method != "truck", !method.isEmpty {
+                Text("Method: \(method.replacingOccurrences(of: "_", with: " "))")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .padding(.leading, 4)
+            }
+        }
+        .padding(.vertical, 2)
     }
     
     // MARK: - Cycle Days Section (The Push-Off Tool)
