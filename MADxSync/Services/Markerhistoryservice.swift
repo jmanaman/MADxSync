@@ -166,7 +166,15 @@ class MarkerHistoryService: ObservableObject {
         }
 
         // Build URL — multi-tenant isolation via district_id=eq.X (defense in depth alongside RLS)
+        //
+        // marker_type filter: app_markers also receives DOT pager corridor breadcrumbs
+        // (BC_START/BC_TICK/BC_STOP/QTY_CONFIRM) at 5-second cadence during spray runs.
+        // Those rows have no feature_id and historyForFeature filters them out at display
+        // time, so they consume cache budget for nothing. Filter upstream to keep the
+        // 2000-row window populated only with markers the popup can actually show.
+        // UNDO must be included so filterAndSort can suppress UNDO targets.
         var urlString = "\(supabaseURL)/rest/v1/app_markers?district_id=eq.\(districtId)"
+        urlString += "&marker_type=in.(TREATMENT,SPOT_TREAT,OBSERVED,LARVAE,PUPAE,DIP,UNDO)"
         urlString += "&order=timestamp_iso.desc"
         urlString += "&limit=\(fetchLimit)"
 
@@ -260,6 +268,13 @@ class MarkerHistoryService: ObservableObject {
                 // Full replace
                 markers = filterAndSort(fetched)
                 print("[MarkerHistory] Full sync: \(markers.count) markers (after undo filter)")
+            }
+
+            // Diagnostic: report the effective window so we can spot budget exhaustion
+            // before users do. If oldest creeps inside 30 days, the 2000-row cap is
+            // shrinking the window — investigate volume.
+            if let oldest = markers.last?.timestamp_iso, let newest = markers.first?.timestamp_iso {
+                print("[MarkerHistory] Window: \(oldest) → \(newest)")
             }
 
             lastSync = Date()

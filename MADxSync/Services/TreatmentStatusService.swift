@@ -144,7 +144,8 @@ class TreatmentStatusService: ObservableObject {
                 lastTreatedBy: status.last_treated_by,
                 lastChemical: status.last_chemical,
                 cycleDays: status.cycle_days,
-                isLocalOverride: false
+                isLocalOverride: false,
+                isObserved: false
             )
         }
         
@@ -152,15 +153,20 @@ class TreatmentStatusService: ObservableObject {
         if let local = localOverrides[featureId] {
             let hoursSince = Date().timeIntervalSince(local.treatedAt) / 3600
             if hoursSince < 24 {
+                let observed = local.isObserved ?? false
                 return FeatureStatusInfo(
                     color: TreatmentColors.fresh,
-                    statusText: "Just Treated (pending sync)",
+                    // Honest status text — observation must not claim treatment.
+                    // Both reset the cycle and turn the polygon green, but only
+                    // one of them actually applied a chemical.
+                    statusText: observed ? "Just Observed (pending sync)" : "Just Treated (pending sync)",
                     daysSince: 0,
                     lastTreated: local.treatedAt,
                     lastTreatedBy: local.technician,
                     lastChemical: local.chemical,
                     cycleDays: local.cycleDays,
-                    isLocalOverride: true
+                    isLocalOverride: true,
+                    isObserved: observed
                 )
             }
         }
@@ -175,7 +181,13 @@ class TreatmentStatusService: ObservableObject {
                 lastTreatedBy: status.last_treated_by,
                 lastChemical: status.last_chemical,
                 cycleDays: status.cycle_days,
-                isLocalOverride: false
+                isLocalOverride: false,
+                // Hub-side status doesn't currently surface observed-vs-treated
+                // back to the app — this defaults to false. If chemical is empty
+                // on a green Hub status, the app falls back to non-misleading
+                // labels because lastChemical is nil. A future Hub-side enhancement
+                // could thread observed state into HubTreatmentStatus.
+                isObserved: false
             )
         }
         
@@ -188,20 +200,24 @@ class TreatmentStatusService: ObservableObject {
             lastTreatedBy: nil,
             lastChemical: nil,
             cycleDays: 7,
-            isLocalOverride: false
+            isLocalOverride: false,
+            isObserved: false
         )
     }
     
     // MARK: - Optimistic Local Treatment
     
-    /// Call when a tech treats a feature in the app.
+    /// Call when a tech treats (or observes) a feature in the app.
     /// Immediately marks it green locally, queues sync to Hub.
+    /// When `isObserved=true`, the Hub push emits FIELD_OBSERVE / status=OBSERVED
+    /// so chemical-use reports don't count the cycle reset as an application.
     func markTreatedLocally(
         featureId: String,
         featureType: String,
         chemical: String?,
         technician: String? = nil,
-        cycleDays: Int = 7
+        cycleDays: Int = 7,
+        isObserved: Bool = false
     ) {
         let treatment = LocalTreatment(
             featureId: featureId,
@@ -210,14 +226,15 @@ class TreatmentStatusService: ObservableObject {
             chemical: chemical,
             technician: technician,
             cycleDays: cycleDays,
-            syncedToHub: false
+            syncedToHub: false,
+            isObserved: isObserved
         )
         
         localOverrides[featureId] = treatment
         statusVersion += 1  // Trigger map overlay rebuild
         saveOverridesToCache()
         
-        print("[TreatmentStatus] Local override: \(featureId) → green (v\(statusVersion))")
+        print("[TreatmentStatus] Local override: \(featureId) → green (v\(statusVersion)) \(isObserved ? "[OBSERVED]" : "[TREATED]")")
     }
     
     /// Revert a local treatment (undo accidental tap).
@@ -394,38 +411,103 @@ class TreatmentStatusService: ObservableObject {
     }
     
     // MARK: - Push Local Treatments to Supabase
-    
-    /// Push pending local treatments to viewer_logs so Hub can process them
+    //
+    // ⚠️ DISABLED 2026-04-24 — DO NOT RE-ENABLE WITHOUT FIXING HUB SIDE FIRST.
+    //
+    // These two methods (pushLocalTreatments + pushTreatmentToViewerLogs)
+    // write directly to the `viewer_logs` table with action strings Hub
+    // does NOT process:
+    //
+    //   - FIELD_OBSERVE: zero handlers anywhere in the Hub codebase. Every
+    //     Hub treatment parser matches `action.includes('FIELD_TREAT')`, so
+    //     an observation pushed via this path is silently dropped. The
+    //     polygon would revert to red after the local 24h override expires.
+    //
+    //   - The TREATED branch is technically valid but redundant — the
+    //     canonical sync path is addMarker() → app_markers → Hub api.js,
+    //     which already handles both TREATED and OBSERVED correctly via
+    //     marker_type discrimination.
+    //
+    // CONFIRMED: No external callers exist anywhere in MADxSync. These
+    // methods were defined but never invoked. Bodies are preserved below
+    // (commented) in case the design intent needs to be revived later.
+    //
+    // IF YOU NEED TO RE-ENABLE:
+    //   1. Change the FIELD_OBSERVE event type to FIELD_TREAT and let the
+    //      `status=OBSERVED` segment do the discrimination — this matches
+    //      Hub api.js convention at js/api.js line 339.
+    //   2. Verify the resulting action string parses correctly through
+    //      Hub's viewer_logs consumer pipeline before merging.
+    //   3. Confirm no double-counting against the app_markers path
+    //      (which already handles this — that's why the method is unused).
+    //
+    // The no-op stubs below preserve the public API surface so that if any
+    // future caller is added without re-reading this comment block, the
+    // call compiles and logs a loud warning instead of silently corrupting
+    // observed-cycle resets.
+
+    /// DISABLED — see comment block above. No-op with warning log.
     func pushLocalTreatments() async {
+        print("[TreatmentStatus] ⚠️ pushLocalTreatments() called but DISABLED — see method comment. No-op.")
+        return
+
+        /* DISABLED — original body preserved for reference
+
         // Network guard
         guard NetworkMonitor.shared.hasInternet else {
             print("[TreatmentStatus] Push skipped — no internet")
             return
         }
-        
+
         let pending = localOverrides.values.filter { !$0.syncedToHub }
         guard !pending.isEmpty else { return }
-        
+
         for treatment in pending {
             let success = await pushTreatmentToViewerLogs(treatment)
             if success {
                 localOverrides[treatment.featureId]?.syncedToHub = true
             }
         }
-        
+
         saveOverridesToCache()
         print("[HubTreatmentStatus] Pushed \(pending.count) local treatments to viewer_logs")
+
+        */
     }
-    
+
+    /// DISABLED — see pushLocalTreatments comment block. No-op with warning log.
     private func pushTreatmentToViewerLogs(_ treatment: LocalTreatment) async -> Bool {
+        print("[TreatmentStatus] ⚠️ pushTreatmentToViewerLogs() called but DISABLED — see pushLocalTreatments comment. No-op.")
+        return false
+
+        /* DISABLED — original body preserved for reference
+
         guard let url = URL(string: "\(supabaseURL)/rest/v1/viewer_logs") else { return false }
-        
+
         let formatter = ISO8601DateFormatter()
         let timestamp = formatter.string(from: treatment.treatedAt)
-        
+
+        // OBSERVED events must not impersonate chemical applications on Hub.
+        // Hub parses the `action` string for type + status + chemical; if we
+        // emit FIELD_TREAT,status=TREATED,chemical=Unknown for an observation,
+        // it lands in chemical-use reports as a phantom "Unknown" application.
+        let observed = treatment.isObserved ?? false
+        let eventType = observed ? "FIELD_OBSERVE" : "FIELD_TREAT"
+        let statusStr = observed ? "OBSERVED" : "TREATED"
+
+        // Chemical segment: only emit for TREATED. For OBSERVED we omit it
+        // entirely rather than sending "Unknown" — an observation had no product.
+        let action: String = {
+            if observed {
+                return "\(eventType),family=FIELD,status=\(statusStr)"
+            } else {
+                return "\(eventType),family=FIELD,status=\(statusStr),chemical=\(treatment.chemical ?? "Unknown")"
+            }
+        }()
+
         let payload: [String: Any] = [
             "timestamp_iso": timestamp,
-            "action": "FIELD_TREAT,family=FIELD,status=TREATED,chemical=\(treatment.chemical ?? "Unknown")",
+            "action": action,
             "header": treatment.featureId,
             "subheader": treatment.featureType,
             "lat": 0,  // Will be populated by Hub from feature geometry
@@ -433,13 +515,13 @@ class TreatmentStatusService: ObservableObject {
             "gallons": 0,
             "ounces": 0,
             "psi": 0,
-            "mix": treatment.chemical ?? "",
+            "mix": observed ? "" : (treatment.chemical ?? ""),
             "relays": "",
             "truck_id": ""  // App doesn't have truck_id context
         ]
-        
+
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return false }
-        
+
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.httpBody = body
@@ -451,7 +533,7 @@ class TreatmentStatusService: ObservableObject {
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
         request.setValue("return=minimal", forHTTPHeaderField: "Prefer")
-        
+
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
             if let httpResponse = response as? HTTPURLResponse {
@@ -462,6 +544,8 @@ class TreatmentStatusService: ObservableObject {
             print("[HubTreatmentStatus] Push error: \(error)")
             return false
         }
+
+        */
     }
     
     // MARK: - Cleanup
@@ -803,6 +887,11 @@ struct FeatureStatusInfo {
     let lastChemical: String?
     let cycleDays: Int
     let isLocalOverride: Bool
+    // True when the most recent local action that set this status was an
+    // observation (no chemical applied), false otherwise. The UI uses this
+    // to choose honest labels — "Last Inspected" vs "Last Treated" — so
+    // the popup never claims a treatment occurred when only an observation did.
+    let isObserved: Bool
     
     var formattedLastTreated: String {
         guard let date = lastTreated else { return "Never" }
@@ -822,4 +911,9 @@ struct LocalTreatment: Codable {
     let technician: String?
     let cycleDays: Int
     var syncedToHub: Bool
+    // Optional for backward compatibility with cached overrides written before
+    // this field existed — missing value on decode = nil = treat as non-observed.
+    // When true, the push path emits FIELD_OBSERVE / status=OBSERVED instead of
+    // the default FIELD_TREAT / status=TREATED.
+    var isObserved: Bool? = nil
 }

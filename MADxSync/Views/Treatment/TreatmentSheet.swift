@@ -211,14 +211,35 @@ struct TreatmentSheet: View {
     
     // MARK: - Save
     private func saveMarker() {
+        // OBSERVED markers must NOT carry chemical/dose data — an observation
+        // is a presence record ("inspected, no treatment needed"), not a
+        // chemical application. Mirrors the rule enforced in
+        // FieldMapView.dropTreatmentMarker and defended in depth by
+        // FieldMarkerModel.toFLOPayload, toCSVRow, and markerType.
+        //
+        // (trapNumber is the exception — see comment below the field.)
+        //
+        // Without this guard, an OBSERVED save here would land in Hub's
+        // chemical-use reports as a phantom application — the original bug
+        // patched in FieldMapView on 2026-04-24 would reappear via this
+        // sheet path. This file is currently only referenced from a #Preview
+        // block, but is patched defensively in case it's ever wired into
+        // production UI.
+        let isTreated = (status == .treated)
+
         let marker = FieldMarker(
             lat: coordinate.latitude,
             lon: coordinate.longitude,
             family: family.rawValue,
             status: status.rawValue,
-            chemical: selectedChemical?.name,
-            doseValue: Double(doseValue),
-            doseUnit: doseUnit.rawValue,
+            chemical: isTreated ? selectedChemical?.name : nil,
+            doseValue: isTreated ? Double(doseValue) : nil,
+            doseUnit: isTreated ? doseUnit.rawValue : nil,
+            // trapNumber is intentionally NOT gated on isTreated — an OBSERVED
+            // trap inspection ("trap #5 checked, no treatment needed") is a
+            // valid record that should retain the trap identifier. This
+            // matches FieldMarkerModel.toCSVRow which emits trapNumber for
+            // both TREATED and OBSERVED.
             trapNumber: family == .trap ? trapNumber : nil,
             larvae: larvaeLevel?.rawValue,
             pupaePresent: pupaePresent,

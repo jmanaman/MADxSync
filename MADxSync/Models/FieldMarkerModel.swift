@@ -297,10 +297,19 @@ struct FieldMarker: Identifiable, Codable {
     }
     
     /// Marker type for database
+    ///
+    /// OBSERVED is a presence record, not a chemical application. Hub's
+    /// chemical-use reports filter on marker_type, so OBSERVED must be its
+    /// own row type — never "TREATMENT" — or it will inflate chemical totals.
     var markerType: String {
         if noteText != nil {
             return "NOTE"
         } else if family != nil {
+            // Differentiate application (TREATMENT) from inspection (OBSERVED).
+            // Matches Hub's expected marker_type values in Markerhistoryservice.
+            if status == TreatmentStatus.observed.rawValue {
+                return "OBSERVED"
+            }
             return "TREATMENT"
         } else if larvae != nil {
             return "LARVAE"
@@ -315,8 +324,17 @@ struct FieldMarker: Identifiable, Codable {
     
     /// Generate payload for FLO's /viewer_log/add endpoint
     func toFLOPayload() -> [String: Any] {
+        // Distinguish application from inspection. FLO's viewer_log consumers
+        // treat FIELD_TREAT as a chemical event — OBSERVED must not land there,
+        // or gallons/product totals downstream will include non-applications.
+        let isObserved = (status == TreatmentStatus.observed.rawValue)
+        let eventType: String = {
+            if isObserved { return "FIELD_OBSERVE" }
+            return "FIELD_TREAT"
+        }()
+        
         var payload: [String: Any] = [
-            "type": "FIELD_TREAT",
+            "type": eventType,
             "header": "",
             "sub": ""
         ]
@@ -332,7 +350,8 @@ struct FieldMarker: Identifiable, Codable {
         if let status = status {
             payloadData["status"] = status
         }
-        // Primary product (backward compat — FLO always gets first product in flat fields)
+        // Primary product (backward compat — FLO always gets first product in flat fields).
+        // For OBSERVED, these are nil by construction at the save site, so nothing to emit.
         if let chemical = chemical {
             payloadData["chem"] = chemical
         }
@@ -346,7 +365,7 @@ struct FieldMarker: Identifiable, Codable {
             payloadData["trapNumber"] = trapNumber
         }
         
-        // Multi-product array — only included when 2+ products
+        // Multi-product array — only included when 2+ products (TREATED only)
         if let products = products, products.count > 1 {
             let productDicts = products.map { p -> [String: Any] in
                 ["chem": p.chemical, "doseValue": p.doseValue, "doseUnit": p.doseUnit]
@@ -450,14 +469,24 @@ struct FieldMarker: Identifiable, Codable {
         var action = ""
         
         if let family = family {
-            action = "FIELD_TREAT family=\(family)"
+            // Distinguish application from inspection in the action prefix —
+            // see toFLOPayload() and TreatmentStatusService for the same rule.
+            // Without this, any consumer of the CSV (offline replay tools,
+            // FLO firmware, future Hub importers) would treat observations as
+            // chemical applications.
+            let isObserved = (status == TreatmentStatus.observed.rawValue)
+            action = isObserved ? "FIELD_OBSERVE family=\(family)" : "FIELD_TREAT family=\(family)"
             if let status = status { action += " status=\(status)" }
-            if let chemical = chemical { action += " chem=\(chemical)" }
-            if let doseValue = doseValue { action += " doseValue=\(doseValue)" }
-            if let doseUnit = doseUnit { action += " doseUnit=\(doseUnit)" }
+            // Chemical/dose only emit for non-observed events. Observed markers
+            // are constructed with these as nil, but defend in depth here too.
+            if !isObserved {
+                if let chemical = chemical { action += " chem=\(chemical)" }
+                if let doseValue = doseValue { action += " doseValue=\(doseValue)" }
+                if let doseUnit = doseUnit { action += " doseUnit=\(doseUnit)" }
+            }
             if let trapNumber = trapNumber { action += " trapNumber=\(trapNumber)" }
-            // Additional products beyond primary
-            if let products = products, products.count > 1 {
+            // Additional products beyond primary — TREATED only.
+            if !isObserved, let products = products, products.count > 1 {
                 for (i, p) in products.dropFirst().enumerated() {
                     action += " chem\(i+2)=\(p.chemical) doseValue\(i+2)=\(p.doseValue) doseUnit\(i+2)=\(p.doseUnit)"
                 }

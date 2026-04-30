@@ -39,6 +39,13 @@ final class HubSyncService: ObservableObject {
     
     static let shared = HubSyncService()
     
+    // MARK: - Published State (UI-observable)
+    
+    /// True whenever ANY channel is currently pulling. Drives the sync indicator
+    /// in the UI so techs can see that a brief stall is intentional sync activity,
+    /// not a crash. Updated inside setBusy() — the single chokepoint all pulls use.
+    @Published private(set) var isSyncing: Bool = false
+    
     // MARK: - Configuration
     
     /// Fast poll interval: operationally time-sensitive channels
@@ -545,6 +552,13 @@ final class HubSyncService: ObservableObject {
     
     private func setBusy(_ channel: String, _ busy: Bool) {
         channelBusy[channel] = busy
+        
+        // Recompute the published sync indicator. True if ANY channel is busy.
+        // Cheap — dictionary scan of ~6 entries. Runs only when busy state changes.
+        let anyBusy = channelBusy.values.contains(true)
+        if anyBusy != isSyncing {
+            isSyncing = anyBusy
+        }
     }
     
     // MARK: - Logging (silent, console only)

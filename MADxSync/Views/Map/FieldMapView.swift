@@ -43,6 +43,7 @@ struct FieldMapView: View {
     @ObservedObject private var sourceFinderService = SourceFinderService.shared
     @StateObject private var serviceRequestController = ServiceRequestMapController()
     @ObservedObject private var serviceRequestService = ServiceRequestService.shared
+    @ObservedObject private var hubSyncService = HubSyncService.shared
     
     @State private var mapRegion = MKCoordinateRegion(
         center: CLLocationCoordinate2D(latitude: 36.2077, longitude: -119.3473),
@@ -100,6 +101,9 @@ struct FieldMapView: View {
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
                     FLOControlView()
+                    Spacer()
+                    SyncIndicatorView(isSyncing: hubSyncService.isSyncing)
+                        .padding(.top, 6)
                     Spacer()
                     LayerButton(
                         showLayerSheet: $showLayerSheet,
@@ -339,14 +343,21 @@ struct FieldMapView: View {
             return
         }
         
-        let snapResult = SnapService.checkSnap(
-            coordinate: coordinate,
-            pointSites: layerVisibility.showPointSites ? spatialService.pointSites : [],
-            stormDrains: layerVisibility.showStormDrains ? spatialService.stormDrains : [],
-            pendingSources: layerVisibility.showPendingSources ? AddSourceService.shared.sources : [],
-            sourceFinderPins: SourceFinderService.shared.pins,
-            serviceRequestPins: ServiceRequestService.shared.requests
-        )
+        // Snap is disabled during Add Source digitizing. Snapping a new polygon
+        // vertex / polyline node / point-site / storm-drain to a nearby existing
+        // feature makes it impossible to place geometry close to other geometry,
+        // and corrupts the shape the user is trying to draw. Use the raw tap.
+        let snapResult: SnapResult? = {
+            if activeTool == .addSource { return nil }
+            return SnapService.checkSnap(
+                coordinate: coordinate,
+                pointSites: layerVisibility.showPointSites ? spatialService.pointSites : [],
+                stormDrains: layerVisibility.showStormDrains ? spatialService.stormDrains : [],
+                pendingSources: layerVisibility.showPendingSources ? AddSourceService.shared.sources : [],
+                sourceFinderPins: SourceFinderService.shared.pins,
+                serviceRequestPins: ServiceRequestService.shared.requests
+            )
+        }()
         
         let finalCoordinate = snapResult?.coordinate ?? coordinate
         
@@ -536,20 +547,37 @@ struct FieldMapView: View {
             }
             
             // 4. Create marker with snapped coordinate and feature info
+            //
+            // OBSERVED semantics: inspection found the source does NOT need
+            // treatment this cycle. Carries NO chemical/dose/application_method,
+            // serializes as marker_type=OBSERVED so Hub chemical-use reports
+            // exclude it — BUT the feature still flips green and the treatment
+            // cycle resets, because the outcome is the same as an application:
+            // the source is handled until the next cycle date.
+            //
+            // TREATED semantics: chemical application. Carries full product
+            // loadout, application method. Feature flips green, cycle resets.
+            let isTreated = (treatmentStatus == .treated)
+            
             // Commit any in-progress dose text before reading values
-            for i in productRows.indices {
-                productRows[i].commitDoseText()
+            // (only matters when treated — observed discards product rows)
+            if isTreated {
+                for i in productRows.indices {
+                    productRows[i].commitDoseText()
+                }
             }
-            // Build products array from context strip loadout
-            let products = productRows.map { row in
+            
+            // Build products array from context strip loadout — TREATED only.
+            // For OBSERVED, no chemicals are attributed to this marker.
+            let products: [ProductRecord] = isTreated ? productRows.map { row in
                 ProductRecord(
                     chemical: row.chemical,
                     doseValue: row.doseValue,
                     doseUnit: row.doseUnit.rawValue
                 )
-            }
+            } : []
             
-            // Primary product goes in flat fields for backward compat
+            // Primary product goes in flat fields for backward compat (TREATED only)
             let primary = products.first
             
             let marker = FieldMarker(
@@ -557,26 +585,39 @@ struct FieldMapView: View {
                 lon: finalCoordinate.longitude,
                 family: treatmentFamily.rawValue,
                 status: treatmentStatus.rawValue,
-                chemical: primary?.chemical,
-                doseValue: primary?.doseValue,
-                doseUnit: primary?.doseUnit,
-                products: products.count > 1 ? products : nil,
+                chemical: isTreated ? primary?.chemical : nil,
+                doseValue: isTreated ? primary?.doseValue : nil,
+                doseUnit: isTreated ? primary?.doseUnit : nil,
+                products: (isTreated && products.count > 1) ? products : nil,
                 featureId: featureId,
                 featureType: featureType,
-                applicationMethod: treatmentStatus == .treated ? applicationMethod.rawValue : nil
+                applicationMethod: isTreated ? applicationMethod.rawValue : nil
             )
             
             markerStore.addMarker(marker)
             
-            // 5. Optimistic local treatment status update
-            if treatmentStatus == .treated || treatmentStatus == .observed {
-                if let fId = featureId, let fType = featureType {
-                    let chemicalLabel = productRows.map { $0.chemical }.joined(separator: " + ")
-                    treatmentStatusService.markTreatedLocally(featureId: fId, featureType: fType, chemical: chemicalLabel)
-                    treatedFeatureStack.append(fId)
-                } else {
-                    treatedFeatureStack.append("")
-                }
+            // 5. Optimistic local treatment status update.
+            // Both TREATED and OBSERVED reset the treatment cycle and flip the
+            // feature green. OBSERVED = "inspected, no treatment needed" — the
+            // cycle clock resets just the same as an application. The marker_type
+            // distinction (TREATMENT vs OBSERVED) is what keeps chemical totals
+            // honest in Hub reports; the visual cycle state is shared.
+            //
+            // For the chemical label on the status card, OBSERVED sends nil so
+            // nothing reads as if a product was applied. The isObserved flag
+            // also flows into the Hub viewer_logs push so that channel emits
+            // FIELD_OBSERVE/status=OBSERVED instead of FIELD_TREAT/status=TREATED.
+            if let fId = featureId, let fType = featureType {
+                let chemicalLabel: String? = isTreated
+                    ? productRows.map { $0.chemical }.joined(separator: " + ")
+                    : nil
+                treatmentStatusService.markTreatedLocally(
+                    featureId: fId,
+                    featureType: fType,
+                    chemical: chemicalLabel,
+                    isObserved: !isTreated
+                )
+                treatedFeatureStack.append(fId)
             } else {
                 treatedFeatureStack.append("")
             }
@@ -2319,6 +2360,15 @@ struct FeatureInfoView: View {
     
     @ViewBuilder private var treatmentStatusSection: some View {
         let status = treatmentStatusService.statusForFeature(featureId)
+        // Pick honest labels for the most recent action. When the latest local
+        // action was an observation, the cycle reset and the polygon is green
+        // — but the words on the card must say "Inspected" not "Treated".
+        // For Hub-sourced statuses, isObserved is currently always false (Hub
+        // does not yet round-trip observed state); the labels default to the
+        // historical "Treatment" terminology in that case.
+        let dateLabel = status.isObserved ? "Last Inspected" : "Last Treated"
+        let byLabel = status.isObserved ? "Inspected By" : "Treated By"
+        let daysLabel = status.isObserved ? "Days Since Visit" : "Days Since Treatment"
         
         Section("Treatment Status") {
             HStack {
@@ -2337,10 +2387,10 @@ struct FeatureInfoView: View {
             }
             
             if let daysSince = status.daysSince {
-                infoRow("Days Since Treatment", "\(daysSince)")
+                infoRow(daysLabel, "\(daysSince)")
             }
-            infoRow("Last Treated", status.formattedLastTreated)
-            if let by = status.lastTreatedBy { infoRow("Treated By", by) }
+            infoRow(dateLabel, status.formattedLastTreated)
+            if let by = status.lastTreatedBy { infoRow(byLabel, by) }
             if let chemical = status.lastChemical { infoRow("Chemical", chemical) }
             infoRow("Cycle", "\(status.cycleDays) days")
         }
@@ -2896,6 +2946,48 @@ struct TreatmentUnitPicker: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Sync Indicator View
+//
+// Small, unobtrusive indicator that appears at the top of the field map
+// whenever HubSyncService is actively pulling data. Reframes the brief
+// "duh" moment between user tap and sync completion as intentional activity
+// rather than a crash. Auto-fades in/out based on hubSyncService.isSyncing.
+//
+// Design:
+// - Tiny spinner + "Syncing" label in a rounded capsule
+// - Subtle opacity (0.75) so it doesn't demand attention
+// - Smooth fade transition — never jumps or flickers
+// - Fixed min-width so it doesn't jitter the layout on/off
+
+struct SyncIndicatorView: View {
+    let isSyncing: Bool
+    
+    var body: some View {
+        HStack(spacing: 6) {
+            if isSyncing {
+                ProgressView()
+                    .scaleEffect(0.7)
+                    .frame(width: 14, height: 14)
+                Text("Syncing")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(
+            Capsule()
+                .fill(Color(.systemBackground).opacity(isSyncing ? 0.75 : 0))
+        )
+        .overlay(
+            Capsule()
+                .stroke(Color.secondary.opacity(isSyncing ? 0.25 : 0), lineWidth: 0.5)
+        )
+        .animation(.easeInOut(duration: 0.25), value: isSyncing)
+        .allowsHitTesting(false)  // Never intercepts taps — map stays fully interactive
     }
 }
 
